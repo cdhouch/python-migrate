@@ -1,0 +1,14 @@
+# Jira to OpenProject Migration Tool - Dependencies
+
+# HTTP requests
+requests>=2.28.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Fuzzy string matching for subject/summary matching
+fuzzywuzzy>=0.18.0
+
+# Levenshtein for faster fuzzy matching (optional but recommended)
+python-Levenshtein>=0.21.0
+
