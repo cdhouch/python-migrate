@@ -33,7 +33,7 @@ A Python-based migration tool for transferring data between platforms:
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/python-migrate.git
+   git clone https://github.com/cdhouch/python-migrate.git
    cd python-migrate
    ```
 
