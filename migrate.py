@@ -110,7 +110,10 @@ BOOKSTACK_BOOK_ID = os.getenv('BOOKSTACK_BOOK_ID')  # Optional: specific book ID
 
 # Authentication
 confluence_auth = (CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN)
-bookstack_auth = (BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET)
+# BookStack uses header-based token auth: Authorization: Token {token_id}:{token_secret}
+bookstack_headers = {
+    'Authorization': f'Token {BOOKSTACK_TOKEN_ID}:{BOOKSTACK_TOKEN_SECRET}'
+} if BOOKSTACK_TOKEN_ID and BOOKSTACK_TOKEN_SECRET else {}
 
 # Cache for BookStack metadata
 _bookstack_books_cache = None
@@ -527,7 +530,7 @@ def fetch_bookstack_shelves():
         return _bookstack_shelves_cache
     
     url = f'{BOOKSTACK_BASE_URL}/api/shelves'
-    response = requests.get(url, auth=bookstack_auth)
+    response = requests.get(url, headers=bookstack_headers)
     response.raise_for_status()
     _bookstack_shelves_cache = {s['name']: s['id'] for s in response.json()['data']}
     print(f'Loaded {len(_bookstack_shelves_cache)} shelves from BookStack.')
@@ -540,7 +543,7 @@ def fetch_bookstack_books(book_id=None):
     
     if book_id:
         url = f'{BOOKSTACK_BASE_URL}/api/books/{book_id}'
-        response = requests.get(url, auth=bookstack_auth)
+        response = requests.get(url, headers=bookstack_headers)
         response.raise_for_status()
         return [response.json()]
     
@@ -551,7 +554,7 @@ def fetch_bookstack_books(book_id=None):
     
     while True:
         params = {'count': per_page, 'page': page}
-        response = requests.get(url, auth=bookstack_auth, params=params)
+        response = requests.get(url, headers=bookstack_headers, params=params)
         response.raise_for_status()
         data = response.json()
         
@@ -585,7 +588,7 @@ def fetch_bookstack_pages(book_id=None):
         if book_id:
             params['book_id'] = book_id
         
-        response = requests.get(url, auth=bookstack_auth, params=params)
+        response = requests.get(url, headers=bookstack_headers, params=params)
         response.raise_for_status()
         data = response.json()
         
@@ -629,7 +632,7 @@ def create_bookstack_book(name, description='', shelf_id=None, dryrun=False):
     if shelf_id:
         payload['shelf_id'] = shelf_id
     
-    response = requests.post(url, auth=bookstack_auth, json=payload)
+    response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         return response.json()
     else:
@@ -656,7 +659,7 @@ def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, 
     if parent_id:
         payload['parent_id'] = parent_id
     
-    response = requests.post(url, auth=bookstack_auth, json=payload)
+    response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         return response.json()
     else:
@@ -674,7 +677,7 @@ def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
     url = f'{BOOKSTACK_BASE_URL}/api/pages/{page_id}'
     
     # Get current page data
-    response = requests.get(url, auth=bookstack_auth)
+    response = requests.get(url, headers=bookstack_headers)
     if response.status_code != 200:
         print(f'Error fetching page {page_id}: {response.status_code}')
         return False
@@ -693,7 +696,7 @@ def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
     # Include required fields
     payload['book_id'] = current_data.get('book_id')
     
-    response = requests.put(url, auth=bookstack_auth, json=payload)
+    response = requests.put(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         return True
     else:
