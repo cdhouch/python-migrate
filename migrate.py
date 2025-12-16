@@ -415,12 +415,12 @@ def set_work_package_parent(child_id, parent_id, dryrun=False):
 def fetch_confluence_spaces(space_key=None):
     """Fetch spaces from Confluence. If space_key is provided, fetch only that space."""
     if space_key:
-        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/space/{space_key}'
+        url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/space/{space_key}'
         response = requests.get(url, auth=confluence_auth)
         response.raise_for_status()
         return [response.json()]
     else:
-        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/space'
+        url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/space'
         spaces = []
         start = 0
         limit = 50
@@ -444,13 +444,13 @@ def fetch_confluence_spaces(space_key=None):
 def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors'):
     """Fetch pages from Confluence. Can fetch all pages in a space or a specific page."""
     if page_id:
-        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}'
+        url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content/{page_id}'
         params = {'expand': expand}
         response = requests.get(url, auth=confluence_auth, params=params)
         response.raise_for_status()
         return [response.json()]
     
-    url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content'
+    url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content'
     pages = []
     start = 0
     limit = 50
@@ -485,7 +485,7 @@ def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,ve
 
 def fetch_confluence_page_children(page_id, expand='body.storage,version'):
     """Fetch child pages of a specific Confluence page."""
-    url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}/child/page'
+    url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content/{page_id}/child/page'
     params = {'expand': expand, 'limit': 50}
     children = []
     start = 0
@@ -1099,6 +1099,10 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         body = page.get('body', {})
         storage = body.get('storage', {})
         html_content = convert_atlassian_storage_to_html(storage)
+        
+        # BookStack requires either HTML or markdown, so provide empty HTML if content is empty
+        if not html_content or html_content.strip() == '':
+            html_content = '<p></p>'  # Empty paragraph to satisfy BookStack requirement
         
         # Determine parent in BookStack
         parent_bookstack_id = None
