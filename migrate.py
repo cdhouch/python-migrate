@@ -668,7 +668,7 @@ def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, 
         return None
 
 
-def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
+def update_bookstack_page(page_id, name=None, html=None, parent_id=None, dryrun=False):
     """Update an existing page in BookStack."""
     if dryrun:
         print(f'[DRYRUN] Would update page {page_id}')
@@ -689,6 +689,8 @@ def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
         payload['name'] = name
     if html is not None:
         payload['html'] = html
+    if parent_id is not None:
+        payload['parent_id'] = parent_id
     
     if not payload:
         return True
@@ -703,6 +705,78 @@ def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
         print(f'Error updating page {page_id}: {response.status_code}')
         print(response.text)
         return False
+
+
+def delete_bookstack_page(page_id, dryrun=False):
+    """Delete a page from BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would delete page {page_id}')
+        return True
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/pages/{page_id}'
+    response = requests.delete(url, headers=bookstack_headers)
+    if response.status_code in [200, 204]:
+        return True
+    else:
+        print(f'Error deleting page {page_id}: {response.status_code}')
+        print(response.text)
+        return False
+
+
+def delete_all_bookstack_pages(book_id=None, dryrun=False):
+    """Delete all pages from a BookStack book."""
+    print('\n' + '=' * 60)
+    print('DELETE PAGES: Removing all pages from BookStack book')
+    print('=' * 60)
+    
+    book_id = book_id or BOOKSTACK_BOOK_ID
+    
+    if not book_id:
+        print('Error: BOOKSTACK_BOOK_ID must be specified')
+        return
+    
+    # Fetch all pages in the book
+    print(f'Fetching pages from book {book_id}...')
+    pages = fetch_bookstack_pages(book_id=book_id)
+    
+    if not pages:
+        print('No pages found in book.')
+        return
+    
+    print(f'Found {len(pages)} pages to delete.')
+    
+    if dryrun:
+        print('\n[DRYRUN] Would delete the following pages:')
+        for page in pages:
+            print(f'  - Page {page["id"]}: {page["name"]}')
+        return
+    
+    # Delete pages (process in reverse order to handle children first if needed)
+    deleted = 0
+    errors = 0
+    
+    # Sort by ID in reverse to potentially delete children before parents
+    # (though BookStack should handle this automatically)
+    pages_sorted = sorted(pages, key=lambda p: p.get('id', 0), reverse=True)
+    
+    for page in pages_sorted:
+        page_id = page['id']
+        page_name = page['name']
+        print(f'\nDeleting page {page_id}: {page_name[:50]}...')
+        
+        if delete_bookstack_page(page_id, dryrun=False):
+            print(f'  Deleted page {page_id}')
+            deleted += 1
+        else:
+            errors += 1
+    
+    # Summary
+    print('\n' + '=' * 60)
+    print('DELETE PAGES SUMMARY')
+    print('=' * 60)
+    print(f'Total pages: {len(pages)}')
+    print(f'Deleted: {deleted}')
+    print(f'Errors: {errors}')
 
 
 # =============================================================================
@@ -1109,7 +1183,20 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         ancestors = page.get('ancestors', [])
         if ancestors:
             parent_confluence_id = ancestors[-1]['id']
+            # Try both string and int versions of the ID for lookup
             parent_bookstack_id = parent_map.get(parent_confluence_id)
+            if not parent_bookstack_id:
+                parent_bookstack_id = parent_map.get(str(parent_confluence_id))
+            if not parent_bookstack_id and isinstance(parent_confluence_id, (str, int)):
+                try:
+                    alt_id = int(parent_confluence_id) if isinstance(parent_confluence_id, str) else str(parent_confluence_id)
+                    parent_bookstack_id = parent_map.get(alt_id)
+                except (ValueError, TypeError):
+                    pass
+            if parent_bookstack_id:
+                print(f'  Found parent: Confluence ID {parent_confluence_id} -> BookStack ID {parent_bookstack_id}')
+            else:
+                print(f'  Warning: Parent Confluence ID {parent_confluence_id} not found in parent_map (parent will be None)')
         
         if dryrun:
             if existing_page:
@@ -1124,12 +1211,20 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         
         try:
             if existing_page:
-                # Update existing
-                result = update_bookstack_page(existing_page['id'], name=page_title, html=html_content, dryrun=dryrun)
+                # Update existing (including parent relationship)
+                result = update_bookstack_page(existing_page['id'], name=page_title, html=html_content, parent_id=parent_bookstack_id, dryrun=dryrun)
                 if result:
-                    print(f'  Updated page {existing_page["id"]}')
+                    bookstack_page_id = existing_page['id']
+                    print(f'  Updated page {bookstack_page_id} (parent: {parent_bookstack_id})')
                     updated += 1
-                    parent_map[page_id] = existing_page['id']
+                    # Store both string and int versions of Confluence ID for lookup
+                    parent_map[page_id] = bookstack_page_id
+                    parent_map[str(page_id)] = bookstack_page_id
+                    if isinstance(page_id, str):
+                        try:
+                            parent_map[int(page_id)] = bookstack_page_id
+                        except (ValueError, TypeError):
+                            pass
                 else:
                     errors += 1
             else:
@@ -1142,9 +1237,18 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
                     dryrun=dryrun
                 )
                 if result:
-                    print(f'  Created page {result["id"]}')
+                    bookstack_page_id = result.get('id')
+                    print(f'  Created page {bookstack_page_id} (parent: {parent_bookstack_id})')
                     created += 1
-                    parent_map[page_id] = result['id']
+                    # Store both string and int versions of Confluence ID for lookup
+                    parent_map[page_id] = bookstack_page_id
+                    parent_map[str(page_id)] = bookstack_page_id
+                    if isinstance(page_id, (str, int)):
+                        try:
+                            alt_id = int(page_id) if isinstance(page_id, str) else str(page_id)
+                            parent_map[alt_id] = bookstack_page_id
+                        except (ValueError, TypeError):
+                            pass
                     existing_by_confluence_id[page_title] = result
                 else:
                     errors += 1
@@ -1253,6 +1357,8 @@ Examples:
   python migrate.py confluence --sync-pages --dryrun
   python migrate.py confluence --sync-pages
   python migrate.py confluence --sync-spaces --dryrun
+  python migrate.py confluence --delete-pages --dryrun  # Delete all pages from book
+  python migrate.py confluence --delete-pages            # Actually delete pages
         """
     )
     
@@ -1278,6 +1384,8 @@ Examples:
                             help='Sync pages from Confluence to BookStack (Confluence only)')
     mode_group.add_argument('--sync-spaces', action='store_true',
                             help='Sync spaces from Confluence to BookStack as books (Confluence only)')
+    mode_group.add_argument('--delete-pages', action='store_true',
+                            help='Delete all pages from a BookStack book (Confluence only)')
     
     # Options
     parser.add_argument('--dryrun', action='store_true',
@@ -1352,6 +1460,11 @@ Examples:
             sync_confluence_spaces(
                 dryrun=args.dryrun,
                 skip_existing=not args.update_existing
+            )
+        elif args.delete_pages:
+            delete_all_bookstack_pages(
+                book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None,
+                dryrun=args.dryrun
             )
     
     return 0
