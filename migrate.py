@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Jira to OpenProject Migration Tool
+Migration Tool - Jira to OpenProject / Confluence to BookStack
 
 A Python-based migration tool that handles:
-- Syncing issues from Jira to OpenProject
-- Assigning children to their parent Epics
-- Diagnostics for troubleshooting
+- Jira to OpenProject: Syncing issues and assigning children to parent Epics
+- Confluence to BookStack: Syncing pages and maintaining page hierarchies
 
 Usage:
-    python migrate.py --sync-issues [--dryrun]
-    python migrate.py --assign-epics [--dryrun]
-    python migrate.py --diagnose
-    python migrate.py --list-epics
+    # Jira to OpenProject
+    python migrate.py jira --sync-issues [--dryrun]
+    python migrate.py jira --assign-epics [--dryrun]
+    
+    # Confluence to BookStack
+    python migrate.py confluence --sync-pages [--dryrun]
+    python migrate.py confluence --sync-spaces [--dryrun]
 """
 
 import requests
@@ -22,11 +24,21 @@ import argparse
 import tempfile
 import shutil
 from fuzzywuzzy import fuzz
+from enum import Enum
 
 load_dotenv()
 
 # =============================================================================
-# Configuration
+# Migration Type Enum
+# =============================================================================
+
+class MigrationType(Enum):
+    JIRA_TO_OPENPROJECT = "jira"
+    CONFLUENCE_TO_BOOKSTACK = "confluence"
+
+
+# =============================================================================
+# Configuration - Jira to OpenProject
 # =============================================================================
 
 # Jira credentials
@@ -78,6 +90,32 @@ PRIORITY_MAPPING = {
 _op_types_cache = None
 _op_statuses_cache = None
 _op_priorities_cache = None
+
+
+# =============================================================================
+# Configuration - Confluence to BookStack
+# =============================================================================
+
+# Confluence credentials
+CONFLUENCE_BASE_URL = os.getenv('CONFLUENCE_HOST')  # e.g., 'yourcompany.atlassian.net'
+CONFLUENCE_EMAIL = os.getenv('CONFLUENCE_EMAIL')
+CONFLUENCE_API_TOKEN = os.getenv('CONFLUENCE_API_TOKEN')
+CONFLUENCE_SPACE_KEY = os.getenv('CONFLUENCE_SPACE_KEY')  # e.g., 'SPACE'
+
+# BookStack credentials
+BOOKSTACK_BASE_URL = os.getenv('BOOKSTACK_HOST')  # e.g., 'https://bookstack.example.com'
+BOOKSTACK_TOKEN_ID = os.getenv('BOOKSTACK_TOKEN_ID')
+BOOKSTACK_TOKEN_SECRET = os.getenv('BOOKSTACK_TOKEN_SECRET')
+BOOKSTACK_BOOK_ID = os.getenv('BOOKSTACK_BOOK_ID')  # Optional: specific book ID
+
+# Authentication
+confluence_auth = (CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN)
+bookstack_auth = (BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET)
+
+# Cache for BookStack metadata
+_bookstack_books_cache = None
+_bookstack_shelves_cache = None
+
 
 # =============================================================================
 # Jira API Functions
@@ -368,7 +406,304 @@ def set_work_package_parent(child_id, parent_id, dryrun=False):
 
 
 # =============================================================================
-# Migration Functions
+# Confluence API Functions
+# =============================================================================
+
+def fetch_confluence_spaces(space_key=None):
+    """Fetch spaces from Confluence. If space_key is provided, fetch only that space."""
+    if space_key:
+        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/space/{space_key}'
+        response = requests.get(url, auth=confluence_auth)
+        response.raise_for_status()
+        return [response.json()]
+    else:
+        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/space'
+        spaces = []
+        start = 0
+        limit = 50
+        
+        while True:
+            params = {'start': start, 'limit': limit}
+            response = requests.get(url, auth=confluence_auth, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            spaces.extend(data.get('results', []))
+            
+            if len(data.get('results', [])) < limit:
+                break
+            start += limit
+        
+        print(f'Found {len(spaces)} spaces in Confluence.')
+        return spaces
+
+
+def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors'):
+    """Fetch pages from Confluence. Can fetch all pages in a space or a specific page."""
+    if page_id:
+        url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}'
+        params = {'expand': expand}
+        response = requests.get(url, auth=confluence_auth, params=params)
+        response.raise_for_status()
+        return [response.json()]
+    
+    url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content'
+    pages = []
+    start = 0
+    limit = 50
+    
+    params = {
+        'start': start,
+        'limit': limit,
+        'expand': expand,
+        'type': 'page'
+    }
+    
+    if space_key:
+        params['spaceKey'] = space_key
+    
+    while True:
+        params['start'] = start
+        response = requests.get(url, auth=confluence_auth, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        pages.extend(data.get('results', []))
+        
+        if len(data.get('results', [])) < limit:
+            break
+        start += limit
+        
+        print(f'Fetched {len(pages)} pages so far...')
+    
+    print(f'Found {len(pages)} pages in Confluence.')
+    return pages
+
+
+def fetch_confluence_page_children(page_id, expand='body.storage,version'):
+    """Fetch child pages of a specific Confluence page."""
+    url = f'https://{CONFLUENCE_BASE_URL}/rest/api/content/{page_id}/child/page'
+    params = {'expand': expand, 'limit': 50}
+    children = []
+    start = 0
+    
+    while True:
+        params['start'] = start
+        response = requests.get(url, auth=confluence_auth, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        children.extend(data.get('results', []))
+        
+        if len(data.get('results', [])) < 50:
+            break
+        start += 50
+    
+    return children
+
+
+def convert_atlassian_storage_to_html(storage):
+    """Convert Atlassian Document Format (storage format) to HTML."""
+    if not storage:
+        return ''
+    if isinstance(storage, str):
+        return storage
+    
+    # If it's already HTML, return as-is
+    if isinstance(storage, dict) and 'value' in storage:
+        return storage.get('value', '')
+    
+    return str(storage)
+
+
+# =============================================================================
+# BookStack API Functions
+# =============================================================================
+
+def fetch_bookstack_shelves():
+    """Fetch all shelves from BookStack."""
+    global _bookstack_shelves_cache
+    if _bookstack_shelves_cache:
+        return _bookstack_shelves_cache
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/shelves'
+    response = requests.get(url, auth=bookstack_auth)
+    response.raise_for_status()
+    _bookstack_shelves_cache = {s['name']: s['id'] for s in response.json()['data']}
+    print(f'Loaded {len(_bookstack_shelves_cache)} shelves from BookStack.')
+    return _bookstack_shelves_cache
+
+
+def fetch_bookstack_books(book_id=None):
+    """Fetch books from BookStack. If book_id is provided, fetch only that book."""
+    global _bookstack_books_cache
+    
+    if book_id:
+        url = f'{BOOKSTACK_BASE_URL}/api/books/{book_id}'
+        response = requests.get(url, auth=bookstack_auth)
+        response.raise_for_status()
+        return [response.json()]
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/books'
+    books = []
+    page = 1
+    per_page = 100
+    
+    while True:
+        params = {'count': per_page, 'page': page}
+        response = requests.get(url, auth=bookstack_auth, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        books.extend(data.get('data', []))
+        
+        if len(data.get('data', [])) < per_page:
+            break
+        page += 1
+        print(f'Fetched {len(books)} books so far...')
+    
+    print(f'Found {len(books)} books in BookStack.')
+    
+    # Update cache
+    if not _bookstack_books_cache:
+        _bookstack_books_cache = {}
+    for book in books:
+        _bookstack_books_cache[book['name']] = book['id']
+    
+    return books
+
+
+def fetch_bookstack_pages(book_id=None):
+    """Fetch pages from BookStack. If book_id is provided, filter by that book."""
+    url = f'{BOOKSTACK_BASE_URL}/api/pages'
+    pages = []
+    page = 1
+    per_page = 100
+    
+    while True:
+        params = {'count': per_page, 'page': page}
+        if book_id:
+            params['book_id'] = book_id
+        
+        response = requests.get(url, auth=bookstack_auth, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        pages.extend(data.get('data', []))
+        
+        if len(data.get('data', [])) < per_page:
+            break
+        page += 1
+        print(f'Fetched {len(pages)} pages so far...')
+    
+    print(f'Found {len(pages)} pages in BookStack.')
+    return pages
+
+
+def find_bookstack_page_by_confluence_id(confluence_id, book_id=None):
+    """Find a BookStack page by Confluence ID (stored in page name or markdown)."""
+    pages = fetch_bookstack_pages(book_id)
+    
+    # Look for Confluence ID in page HTML or name
+    for page in pages:
+        # Check if Confluence ID is in the page content or name
+        # This is a simple implementation - you might need to store it differently
+        if confluence_id in page.get('name', '') or confluence_id in page.get('html', ''):
+            return page
+    
+    return None
+
+
+def create_bookstack_book(name, description='', shelf_id=None, dryrun=False):
+    """Create a new book in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would create book: {name}')
+        return {'id': 'dryrun_id', 'name': name}
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/books'
+    payload = {
+        'name': name,
+        'description': description or '',
+    }
+    
+    if shelf_id:
+        payload['shelf_id'] = shelf_id
+    
+    response = requests.post(url, auth=bookstack_auth, json=payload)
+    if response.status_code in [200, 201]:
+        return response.json()
+    else:
+        print(f'Error creating book: {response.status_code}')
+        print(response.text)
+        return None
+
+
+def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, dryrun=False):
+    """Create a new page in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would create page: {name} in book {book_id}')
+        return {'id': 'dryrun_id', 'name': name}
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/pages'
+    payload = {
+        'name': name,
+        'html': html,
+        'book_id': book_id,
+    }
+    
+    if chapter_id:
+        payload['chapter_id'] = chapter_id
+    if parent_id:
+        payload['parent_id'] = parent_id
+    
+    response = requests.post(url, auth=bookstack_auth, json=payload)
+    if response.status_code in [200, 201]:
+        return response.json()
+    else:
+        print(f'Error creating page: {response.status_code}')
+        print(response.text)
+        return None
+
+
+def update_bookstack_page(page_id, name=None, html=None, dryrun=False):
+    """Update an existing page in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would update page {page_id}')
+        return True
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/pages/{page_id}'
+    
+    # Get current page data
+    response = requests.get(url, auth=bookstack_auth)
+    if response.status_code != 200:
+        print(f'Error fetching page {page_id}: {response.status_code}')
+        return False
+    
+    current_data = response.json()
+    payload = {}
+    
+    if name is not None:
+        payload['name'] = name
+    if html is not None:
+        payload['html'] = html
+    
+    if not payload:
+        return True
+    
+    # Include required fields
+    payload['book_id'] = current_data.get('book_id')
+    
+    response = requests.put(url, auth=bookstack_auth, json=payload)
+    if response.status_code in [200, 201]:
+        return True
+    else:
+        print(f'Error updating page {page_id}: {response.status_code}')
+        print(response.text)
+        return False
+
+
+# =============================================================================
+# Migration Functions - Jira to OpenProject
 # =============================================================================
 
 def convert_atlassian_doc_to_text(doc):
@@ -392,7 +727,7 @@ def convert_atlassian_doc_to_text(doc):
         return ''
 
 
-def sync_issues(dryrun=False, skip_existing=True, specific_keys=None):
+def sync_jira_issues(dryrun=False, skip_existing=True, specific_keys=None):
     """Sync issues from Jira to OpenProject."""
     print('\n' + '=' * 60)
     print('SYNC ISSUES: Migrating from Jira to OpenProject')
@@ -507,8 +842,6 @@ def sync_issues(dryrun=False, skip_existing=True, specific_keys=None):
     print(f'Updated: {updated}')
     print(f'Skipped: {skipped}')
     print(f'Errors: {errors}')
-    
-    return existing_by_jira_id
 
 
 def build_op_mapping(work_packages, jira_items, type_filter=None, diagnose=False):
@@ -604,7 +937,7 @@ def build_op_mapping(work_packages, jira_items, type_filter=None, diagnose=False
     return mapping
 
 
-def assign_epics(dryrun=False, diagnose=False):
+def assign_jira_epics(dryrun=False, diagnose=False):
     """Assign children to their parent Epics in OpenProject."""
     print('\n' + '=' * 60)
     print('ASSIGN EPICS: Setting parent-child relationships')
@@ -656,7 +989,7 @@ def assign_epics(dryrun=False, diagnose=False):
     print(f'Child assignments: {total_assignments}')
 
 
-def list_epics():
+def list_jira_epics():
     """List all Epics in both Jira and OpenProject."""
     print('\n' + '=' * 60)
     print('LISTING EPICS')
@@ -690,81 +1023,332 @@ def list_epics():
 
 
 # =============================================================================
+# Migration Functions - Confluence to BookStack
+# =============================================================================
+
+def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book_id=None):
+    """Sync pages from Confluence to BookStack."""
+    print('\n' + '=' * 60)
+    print('SYNC PAGES: Migrating from Confluence to BookStack')
+    print('=' * 60)
+    
+    space_key = space_key or CONFLUENCE_SPACE_KEY
+    book_id = book_id or BOOKSTACK_BOOK_ID
+    
+    if not space_key:
+        print('Error: CONFLUENCE_SPACE_KEY must be specified')
+        return
+    
+    if not book_id:
+        print('Error: BOOKSTACK_BOOK_ID must be specified')
+        return
+    
+    # Fetch Confluence pages
+    print(f'Fetching pages from Confluence space: {space_key}')
+    confluence_pages = fetch_confluence_pages(space_key=space_key)
+    
+    # Build cache of existing BookStack pages
+    print('\nBuilding cache of existing BookStack pages...')
+    bookstack_pages = fetch_bookstack_pages(book_id=book_id)
+    existing_by_confluence_id = {}
+    
+    # Simple mapping - in production, you'd store Confluence ID in page metadata
+    # For now, we'll match by title (name)
+    for page in bookstack_pages:
+        # You might want to store Confluence ID in the page HTML as a comment
+        existing_by_confluence_id[page['name']] = page
+    
+    print(f'Found {len(existing_by_confluence_id)} existing pages in BookStack.')
+    
+    # Process pages
+    created = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    
+    # Build a map of Confluence page IDs to pages for hierarchy
+    confluence_pages_map = {page['id']: page for page in confluence_pages}
+    parent_map = {}  # Map Confluence page ID to BookStack page ID
+    
+    # Sort pages by depth (root pages first)
+    def get_depth(page):
+        ancestors = page.get('ancestors', [])
+        return len(ancestors)
+    
+    sorted_pages = sorted(confluence_pages, key=get_depth)
+    
+    for page in sorted_pages:
+        page_id = page['id']
+        page_title = page['title']
+        
+        print(f'\nProcessing {page_id}: {page_title[:50]}...')
+        
+        # Check if already exists (by name for now)
+        existing_page = existing_by_confluence_id.get(page_title)
+        
+        if existing_page and skip_existing:
+            print(f'  Skipping - already exists as page {existing_page["id"]}')
+            skipped += 1
+            parent_map[page_id] = existing_page['id']
+            continue
+        
+        # Get page content (HTML)
+        body = page.get('body', {})
+        storage = body.get('storage', {})
+        html_content = convert_atlassian_storage_to_html(storage)
+        
+        # Determine parent in BookStack
+        parent_bookstack_id = None
+        ancestors = page.get('ancestors', [])
+        if ancestors:
+            parent_confluence_id = ancestors[-1]['id']
+            parent_bookstack_id = parent_map.get(parent_confluence_id)
+        
+        if dryrun:
+            if existing_page:
+                print(f'  [DRYRUN] Would update page {existing_page["id"]}')
+                updated += 1
+            else:
+                print(f'  [DRYRUN] Would create new page (parent: {parent_bookstack_id})')
+                created += 1
+            if not existing_page:
+                parent_map[page_id] = 'dryrun_id'
+            continue
+        
+        try:
+            if existing_page:
+                # Update existing
+                result = update_bookstack_page(existing_page['id'], name=page_title, html=html_content, dryrun=dryrun)
+                if result:
+                    print(f'  Updated page {existing_page["id"]}')
+                    updated += 1
+                    parent_map[page_id] = existing_page['id']
+                else:
+                    errors += 1
+            else:
+                # Create new
+                result = create_bookstack_page(
+                    name=page_title,
+                    html=html_content,
+                    book_id=book_id,
+                    parent_id=parent_bookstack_id,
+                    dryrun=dryrun
+                )
+                if result:
+                    print(f'  Created page {result["id"]}')
+                    created += 1
+                    parent_map[page_id] = result['id']
+                    existing_by_confluence_id[page_title] = result
+                else:
+                    errors += 1
+        except Exception as e:
+            print(f'  Error: {e}')
+            errors += 1
+    
+    # Summary
+    print('\n' + '=' * 60)
+    print('SYNC PAGES SUMMARY')
+    print('=' * 60)
+    print(f'Total processed: {len(confluence_pages)}')
+    print(f'Created: {created}')
+    print(f'Updated: {updated}')
+    print(f'Skipped: {skipped}')
+    print(f'Errors: {errors}')
+
+
+def sync_confluence_spaces(dryrun=False, skip_existing=True):
+    """Sync spaces from Confluence to BookStack (as books)."""
+    print('\n' + '=' * 60)
+    print('SYNC SPACES: Migrating Confluence spaces to BookStack books')
+    print('=' * 60)
+    
+    # Fetch Confluence spaces
+    confluence_spaces = fetch_confluence_spaces()
+    
+    # Build cache of existing BookStack books
+    print('\nBuilding cache of existing BookStack books...')
+    bookstack_books = fetch_bookstack_books()
+    existing_by_name = {book['name']: book for book in bookstack_books}
+    print(f'Found {len(existing_by_name)} existing books in BookStack.')
+    
+    # Process spaces
+    created = 0
+    skipped = 0
+    errors = 0
+    
+    for space in confluence_spaces:
+        space_key = space['key']
+        space_name = space['name']
+        space_description = space.get('description', {}).get('plain', {}).get('value', '')
+        
+        print(f'\nProcessing space {space_key}: {space_name}...')
+        
+        # Check if already exists
+        existing_book = existing_by_name.get(space_name)
+        
+        if existing_book and skip_existing:
+            print(f'  Skipping - already exists as book {existing_book["id"]}')
+            skipped += 1
+            continue
+        
+        if dryrun:
+            if existing_book:
+                print(f'  [DRYRUN] Would update book {existing_book["id"]}')
+            else:
+                print(f'  [DRYRUN] Would create new book: {space_name}')
+            created += 1
+            continue
+        
+        try:
+            result = create_bookstack_book(
+                name=space_name,
+                description=space_description,
+                dryrun=dryrun
+            )
+            if result:
+                print(f'  Created book {result["id"]}')
+                created += 1
+                existing_by_name[space_name] = result
+            else:
+                errors += 1
+        except Exception as e:
+            print(f'  Error: {e}')
+            errors += 1
+    
+    # Summary
+    print('\n' + '=' * 60)
+    print('SYNC SPACES SUMMARY')
+    print('=' * 60)
+    print(f'Total processed: {len(confluence_spaces)}')
+    print(f'Created: {created}')
+    print(f'Skipped: {skipped}')
+    print(f'Errors: {errors}')
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Jira to OpenProject Migration Tool',
+        description='Migration Tool - Jira to OpenProject / Confluence to BookStack',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python migrate.py --sync-issues --dryrun     # Preview issue migration
-  python migrate.py --sync-issues              # Migrate all issues
-  python migrate.py --assign-epics --dryrun    # Preview epic assignments
-  python migrate.py --assign-epics             # Assign children to epics
-  python migrate.py --diagnose                 # Show diagnostic info
-  python migrate.py --list-epics               # List all epics
+  # Jira to OpenProject
+  python migrate.py jira --sync-issues --dryrun
+  python migrate.py jira --sync-issues
+  python migrate.py jira --assign-epics --dryrun
+  python migrate.py jira --diagnose
+  python migrate.py jira --list-epics
+  
+  # Confluence to BookStack
+  python migrate.py confluence --sync-pages --dryrun
+  python migrate.py confluence --sync-pages
+  python migrate.py confluence --sync-spaces --dryrun
         """
     )
     
-    # Mode selection
+    # Migration type (source system)
+    parser.add_argument('migration_type', choices=['jira', 'confluence'],
+                        help='Source system type (jira or confluence)')
+    
+    # Mode selection (mutually exclusive)
     mode_group = parser.add_mutually_exclusive_group(required=True)
+    
+    # Jira modes
     mode_group.add_argument('--sync-issues', action='store_true',
                             help='Sync issues from Jira to OpenProject')
     mode_group.add_argument('--assign-epics', action='store_true',
-                            help='Assign children to their parent Epics')
+                            help='Assign children to their parent Epics (Jira only)')
     mode_group.add_argument('--diagnose', action='store_true',
-                            help='Show diagnostics for unmatched Epics')
+                            help='Show diagnostics for unmatched Epics (Jira only)')
     mode_group.add_argument('--list-epics', action='store_true',
-                            help='List all Epics in Jira and OpenProject')
+                            help='List all Epics in Jira and OpenProject (Jira only)')
+    
+    # Confluence modes
+    mode_group.add_argument('--sync-pages', action='store_true',
+                            help='Sync pages from Confluence to BookStack (Confluence only)')
+    mode_group.add_argument('--sync-spaces', action='store_true',
+                            help='Sync spaces from Confluence to BookStack as books (Confluence only)')
     
     # Options
     parser.add_argument('--dryrun', action='store_true',
                         help='Preview changes without making them')
     parser.add_argument('--update-existing', action='store_true',
-                        help='Update existing work packages (default: skip)')
+                        help='Update existing items (default: skip)')
     parser.add_argument('--issues', type=str,
                         help='Comma-separated list of specific Jira issue keys to process')
     
     args = parser.parse_args()
     
-    # Validate configuration
-    if not all([JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
-        print('Error: Jira credentials not configured in .env')
-        print('Required: JIRA_HOST, JIRA_EMAIL, JIRA_API_TOKEN')
-        return 1
+    migration_type = args.migration_type
     
-    if not all([OP_BASE_URL, OP_API_KEY]):
-        print('Error: OpenProject credentials not configured in .env')
-        print('Required: OPENPROJECT_HOST, OPENPROJECT_API_KEY')
-        return 1
+    # Validate configuration based on migration type
+    if migration_type == 'jira':
+        if not all([JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
+            print('Error: Jira credentials not configured in .env')
+            print('Required: JIRA_HOST, JIRA_EMAIL, JIRA_API_TOKEN')
+            return 1
+        
+        if not all([OP_BASE_URL, OP_API_KEY]):
+            print('Error: OpenProject credentials not configured in .env')
+            print('Required: OPENPROJECT_HOST, OPENPROJECT_API_KEY')
+            return 1
+        
+        print(f'Jira Project: {JIRA_PROJECT_KEY}')
+        print(f'OpenProject Project ID: {OP_PROJECT_ID}')
+        print(f'Jira ID Custom Field: customField{JIRA_ID_CUSTOM_FIELD}')
     
-    print(f'Jira Project: {JIRA_PROJECT_KEY}')
-    print(f'OpenProject Project ID: {OP_PROJECT_ID}')
-    print(f'Jira ID Custom Field: customField{JIRA_ID_CUSTOM_FIELD}')
+    elif migration_type == 'confluence':
+        if not all([CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN]):
+            print('Error: Confluence credentials not configured in .env')
+            print('Required: CONFLUENCE_HOST, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN')
+            return 1
+        
+        if not all([BOOKSTACK_BASE_URL, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET]):
+            print('Error: BookStack credentials not configured in .env')
+            print('Required: BOOKSTACK_HOST, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET')
+            return 1
+        
+        print(f'Confluence Space Key: {CONFLUENCE_SPACE_KEY or "Not set"}')
+        print(f'BookStack Book ID: {BOOKSTACK_BOOK_ID or "Not set"}')
     
     if args.dryrun:
         print('\n*** DRY RUN MODE - No changes will be made ***\n')
     
     # Execute selected mode
-    if args.sync_issues:
-        specific_keys = args.issues.split(',') if args.issues else None
-        sync_issues(
-            dryrun=args.dryrun,
-            skip_existing=not args.update_existing,
-            specific_keys=specific_keys
-        )
-    elif args.assign_epics:
-        assign_epics(dryrun=args.dryrun)
-    elif args.diagnose:
-        assign_epics(diagnose=True)
-    elif args.list_epics:
-        list_epics()
+    if migration_type == 'jira':
+        if args.sync_issues:
+            specific_keys = args.issues.split(',') if args.issues else None
+            sync_jira_issues(
+                dryrun=args.dryrun,
+                skip_existing=not args.update_existing,
+                specific_keys=specific_keys
+            )
+        elif args.assign_epics:
+            assign_jira_epics(dryrun=args.dryrun)
+        elif args.diagnose:
+            assign_jira_epics(diagnose=True)
+        elif args.list_epics:
+            list_jira_epics()
+    
+    elif migration_type == 'confluence':
+        if args.sync_pages:
+            sync_confluence_pages(
+                dryrun=args.dryrun,
+                skip_existing=not args.update_existing,
+                space_key=CONFLUENCE_SPACE_KEY,
+                book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None
+            )
+        elif args.sync_spaces:
+            sync_confluence_spaces(
+                dryrun=args.dryrun,
+                skip_existing=not args.update_existing
+            )
     
     return 0
 
 
 if __name__ == '__main__':
     exit(main())
-
