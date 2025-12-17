@@ -1,0 +1,7 @@
+{
+  "_comment": "User email mapping file. Maps display names from Jira/Confluence to email addresses.",
+  "_comment2": "Copy this file to user_map.json and customize with your user mappings.",
+  "_comment3": "This is used when the API doesn't return email addresses for users.",
+  "Example User Name": "example@example.com"
+}
+

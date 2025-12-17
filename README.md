@@ -120,6 +120,27 @@ Before migrating from Jira, create a custom field in OpenProject to store Jira i
 4. Note the field ID (visible in the URL or field list)
 5. Set `JIRA_ID_CUSTOM_FIELD` in your `.env` to this ID
 
+### User Email Mapping (Confluence to BookStack migrations)
+
+When importing users from Atlassian (Jira/Confluence) to BookStack, the API may not return email addresses for all users due to privacy settings. To ensure users are imported correctly, you can create a `user_map.json` file that maps display names to email addresses.
+
+1. Copy the example file:
+   ```bash
+   cp user_map.json.example user_map.json
+   ```
+
+2. Edit `user_map.json` and add mappings for your users:
+   ```json
+   {
+     "John Doe": "john.doe@example.com",
+     "Jane Smith": "jane.smith@example.com"
+   }
+   ```
+
+3. The mapping will be used when the API doesn't return email addresses. Users without emails (or without entries in the mapping) will be skipped.
+
+**Note:** `user_map.json` is excluded from git (via `.gitignore`) to keep your user data private. The `user_map.json.example` file is included as a template.
+
 ## Usage
 
 ### Jira to OpenProject Migration
@@ -210,6 +231,9 @@ python migrate.py confluence --sync-pages --update-existing
 |---------|-------------|
 | `python migrate.py confluence --sync-pages` | Migrate pages from Confluence to BookStack |
 | `python migrate.py confluence --sync-spaces` | Migrate Confluence spaces to BookStack books |
+| `python migrate.py confluence --delete-pages` | Delete all pages and chapters from a BookStack book |
+| `python migrate.py confluence --sync-users --user-source atlassian` | Import users from Atlassian to BookStack |
+| `python migrate.py jira --sync-users --user-source openproject` | Import users from OpenProject to BookStack |
 
 ### Common Options
 
@@ -218,6 +242,7 @@ python migrate.py confluence --sync-pages --update-existing
 | `--dryrun` | Preview changes without applying them |
 | `--update-existing` | Update existing items (default: skip) |
 | `--issues KEYS` | Comma-separated list of specific Jira issue keys |
+| `--user-source SOURCE` | Source for user sync: `atlassian` or `openproject` (required with `--sync-users`) |
 
 ## Type Mappings (Jira to OpenProject)
 
@@ -267,12 +292,15 @@ The tool maps Jira issue types to OpenProject work package types:
 ### Confluence to BookStack
 
 1. **Setup**: Configure `.env` with your credentials
-2. **Migrate Spaces**: Run `python migrate.py confluence --sync-spaces --dryrun` to preview
-3. **Create Books**: Run `python migrate.py confluence --sync-spaces` to create books
-4. **Set Book ID**: Update `BOOKSTACK_BOOK_ID` in `.env` with the target book ID
-5. **Preview Pages**: Run `python migrate.py confluence --sync-pages --dryrun` to preview
-6. **Migrate Pages**: Run `python migrate.py confluence --sync-pages` to migrate pages
-7. **Verify**: Check BookStack to confirm the migration
+2. **Import Users** (Optional but recommended): 
+   - Create `user_map.json` from `user_map.json.example` if needed (see User Email Mapping section)
+   - Run `python migrate.py confluence --sync-users --user-source atlassian` to import users
+3. **Migrate Spaces**: Run `python migrate.py confluence --sync-spaces --dryrun` to preview
+4. **Create Books**: Run `python migrate.py confluence --sync-spaces` to create books
+5. **Set Book ID**: Update `BOOKSTACK_BOOK_ID` in `.env` with the target book ID
+6. **Preview Pages**: Run `python migrate.py confluence --sync-pages --dryrun` to preview
+7. **Migrate Pages**: Run `python migrate.py confluence --sync-pages` to migrate pages
+8. **Verify**: Check BookStack to confirm the migration and user assignments
 
 ## Troubleshooting
 
@@ -299,11 +327,33 @@ The tool fetches all items with proper pagination. If you see incomplete results
 
 ### BookStack Page Hierarchy
 
-For Confluence to BookStack migrations, the tool attempts to preserve page hierarchies by processing root pages first, then children. If parent-child relationships aren't working correctly:
+For Confluence to BookStack migrations, the tool preserves page hierarchies by:
+- Converting parent pages with children into BookStack chapters
+- Assigning child pages to the appropriate ancestor chapter
+- Processing pages in depth order (root pages first)
+
+If parent-child relationships aren't working correctly:
 
 1. Ensure all parent pages are migrated before their children
 2. Check that parent page IDs are correctly stored
 3. Run with `--dryrun` to see the planned structure
+
+### User Email Mapping
+
+When importing users from Atlassian, the API may not return email addresses due to privacy settings. To ensure all users are imported:
+
+1. Copy `user_map.json.example` to `user_map.json`
+2. Add mappings for your users in JSON format:
+   ```json
+   {
+     "Display Name": "email@example.com",
+     "John Doe": "john.doe@example.com"
+   }
+   ```
+3. The mapping will be used when the API doesn't return email addresses
+4. Users without emails (or without entries in the mapping) will be skipped
+
+**Note:** `user_map.json` is excluded from git (via `.gitignore`) to keep your user data private.
 
 ## License
 

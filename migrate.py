@@ -23,6 +23,7 @@ import os
 import argparse
 import tempfile
 import shutil
+import time
 from fuzzywuzzy import fuzz
 from enum import Enum
 
@@ -290,6 +291,44 @@ def fetch_op_priorities():
     return _op_priorities_cache
 
 
+def fetch_op_users():
+    """Fetch all users from OpenProject."""
+    # Use the same auth method as other OpenProject API calls
+    url = f'{OP_BASE_URL}/api/v3/users'
+    users = []
+    offset = 1  # OpenProject uses 1-based offset
+    page_size = 100
+    
+    while True:
+        params = {'offset': offset, 'pageSize': page_size}
+        response = requests.get(url, auth=op_auth, params=params)
+        
+        if response.status_code == 401:
+            print(f'Error: Authentication failed for OpenProject users endpoint')
+            print(f'Response: {response.text[:500]}')
+            print(f'Using auth method: Basic auth with apikey:{OP_API_KEY[:10]}...')
+            response.raise_for_status()
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        elements = data.get('_embedded', {}).get('elements', [])
+        users.extend(elements)
+        
+        # Check if there are more pages
+        total = data.get('total', 0)
+        count = data.get('count', len(elements))
+        
+        if len(elements) < page_size or (total > 0 and offset + count - 1 >= total):
+            break
+        
+        offset += page_size
+        print(f'Fetched {len(users)} users so far...')
+    
+    print(f'Found {len(users)} users in OpenProject.')
+    return users
+
+
 def get_op_type_id(jira_type):
     """Get OpenProject type ID for a Jira issue type."""
     types = fetch_op_types()
@@ -441,7 +480,7 @@ def fetch_confluence_spaces(space_key=None):
         return spaces
 
 
-def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors'):
+def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors,space,history'):
     """Fetch pages from Confluence. Can fetch all pages in a space or a specific page."""
     if page_id:
         url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content/{page_id}'
@@ -503,6 +542,85 @@ def fetch_confluence_page_children(page_id, expand='body.storage,version'):
         start += 50
     
     return children
+
+
+def fetch_atlassian_users():
+    """Fetch all users from Atlassian using Jira API (Jira/Confluence share the same user directory)."""
+    # Use Jira API to fetch users (works for both Jira and Confluence)
+    users = []
+    start_at = 0
+    max_results = 50
+    
+    url = f'https://{JIRA_BASE_URL}/rest/api/3/users/search'
+    
+    while True:
+        # Jira user search API - include email addresses if we have permission
+        params = {
+            'startAt': start_at,
+            'maxResults': max_results
+        }
+        
+        try:
+            response = requests.get(url, auth=jira_auth, params=params)
+            response.raise_for_status()
+            batch_users = response.json()
+            
+            if not batch_users:
+                break
+            
+            users.extend(batch_users)
+            
+            # If we got fewer than max_results, we've reached the end
+            if len(batch_users) < max_results:
+                break
+            
+            start_at += max_results
+            print(f'Fetched {len(users)} users so far...')
+            
+        except requests.exceptions.HTTPError as e:
+            print(f'Error fetching Atlassian users: {e}')
+            if response.status_code == 403:
+                print('  Note: You may need admin permissions to list all users')
+            break
+        except Exception as e:
+            print(f'Error: {e}')
+            break
+    
+    print(f'Found {len(users)} users from search. Fetching detailed info with emails...')
+    
+    # The /users/search endpoint may not return email addresses due to privacy settings
+    # Fetch individual user details which should include email addresses
+    detailed_users = []
+    for i, user_summary in enumerate(users, 1):
+        account_id = user_summary.get('accountId')
+        if account_id:
+            # Fetch detailed user info which should include email
+            user_url = f'https://{JIRA_BASE_URL}/rest/api/3/user'
+            user_params = {'accountId': account_id}
+            
+            try:
+                user_response = requests.get(user_url, auth=jira_auth, params=user_params)
+                if user_response.status_code == 200:
+                    user_detail = user_response.json()
+                    detailed_users.append(user_detail)
+                else:
+                    # Fallback to summary if detail fetch fails
+                    detailed_users.append(user_summary)
+            except Exception:
+                # Fallback to summary on error
+                detailed_users.append(user_summary)
+            
+            # Rate limiting - small delay
+            if i % 20 == 0:
+                time.sleep(0.5)
+                print(f'  Fetched details for {i}/{len(users)} users...')
+            else:
+                time.sleep(0.05)
+        else:
+            detailed_users.append(user_summary)
+    
+    print(f'Retrieved detailed info for {len(detailed_users)} users.')
+    return detailed_users
 
 
 def convert_atlassian_storage_to_html(storage):
@@ -583,21 +701,47 @@ def fetch_bookstack_pages(book_id=None):
     page = 1
     per_page = 100
     
+    # Convert book_id to int for comparison
+    book_id_int = int(book_id) if book_id else None
+    api_total = None  # Will be set from first API response
+    
     while True:
         params = {'count': per_page, 'page': page}
+        # Use book_id in API call - the API filter works correctly
         if book_id:
-            params['book_id'] = book_id
+            params['book_id'] = book_id  # Use original (string) value, API accepts it
         
         response = requests.get(url, headers=bookstack_headers, params=params)
         response.raise_for_status()
         data = response.json()
         
-        pages.extend(data.get('data', []))
+        # Get total from API response (first time only)
+        if api_total is None:
+            api_total = data.get('total', 0)
+            if api_total > 0:
+                print(f'API reports {api_total} total pages for book {book_id}')
         
-        if len(data.get('data', [])) < per_page:
+        page_batch = data.get('data', [])
+        
+        # Add all pages from this batch (API already filtered by book_id)
+        pages.extend(page_batch)
+        
+        # Stop if we got fewer results than requested (end of pages)
+        if len(page_batch) < per_page:
             break
+        
+        # Also stop if we've fetched at least as many as the API says exist
+        if api_total and len(pages) >= api_total:
+            break
+        
         page += 1
-        print(f'Fetched {len(pages)} pages so far...')
+        
+        # Small delay to avoid rate limiting
+        time.sleep(0.1)
+        if book_id_int:
+            print(f'Fetched {len(pages)} pages from book {book_id_int} so far...')
+        else:
+            print(f'Fetched {len(pages)} pages so far...')
     
     print(f'Found {len(pages)} pages in BookStack.')
     return pages
@@ -641,7 +785,131 @@ def create_bookstack_book(name, description='', shelf_id=None, dryrun=False):
         return None
 
 
-def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, dryrun=False):
+def fetch_bookstack_users():
+    """Fetch all users from BookStack."""
+    url = f'{BOOKSTACK_BASE_URL}/api/users'
+    users = []
+    page = 1
+    per_page = 100
+    
+    while True:
+        params = {'count': per_page, 'page': page}
+        response = requests.get(url, headers=bookstack_headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        user_batch = data.get('data', [])
+        users.extend(user_batch)
+        
+        if len(user_batch) < per_page:
+            break
+        page += 1
+    
+    print(f'Found {len(users)} users in BookStack.')
+    return users
+
+
+def fetch_bookstack_chapters(book_id):
+    """Fetch all chapters from a BookStack book."""
+    url = f'{BOOKSTACK_BASE_URL}/api/chapters'
+    chapters = []
+    page = 1
+    per_page = 100
+    
+    book_id_int = int(book_id) if book_id else None
+    api_total = None
+    
+    while True:
+        params = {'count': per_page, 'page': page, 'book_id': book_id}
+        response = requests.get(url, headers=bookstack_headers, params=params)
+        
+        # Handle rate limiting
+        if response.status_code == 429:
+            print(f'Rate limited, waiting 2 seconds...')
+            time.sleep(2)
+            continue
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        # Get total from API response (first time only)
+        if api_total is None:
+            api_total = data.get('total', 0)
+            if api_total > 0:
+                print(f'API reports {api_total} total chapters for book {book_id}')
+        
+        chapter_batch = data.get('data', [])
+        
+        # Filter by book_id if needed (API should filter but verify)
+        if book_id_int:
+            chapter_batch = [c for c in chapter_batch if c.get('book_id') == book_id_int]
+        
+        chapters.extend(chapter_batch)
+        
+        # Stop if we've fetched all chapters according to API total
+        if api_total and len(chapters) >= api_total:
+            break
+        
+        # Also stop if we got fewer results than requested (end of chapters)
+        if len(chapter_batch) < per_page:
+            break
+        
+        page += 1
+        
+        # Rate limiting - small delay between requests
+        time.sleep(0.2)
+    
+    return chapters
+
+
+def create_bookstack_chapter(name, description, book_id, dryrun=False):
+    """Create a new chapter in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would create chapter: {name} in book {book_id}')
+        return {'id': 'dryrun_chapter_id', 'name': name}
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/chapters'
+    payload = {
+        'name': name,
+        'description': description or '',
+        'book_id': book_id,
+    }
+    
+    response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code in [200, 201]:
+        return response.json()
+    else:
+        print(f'Error creating chapter: {response.status_code}')
+        print(response.text)
+        return None
+
+
+def create_bookstack_user(name, email, password=None, dryrun=False):
+    """Create a new user in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would create user: {name} ({email})')
+        return {'id': 'dryrun_user_id', 'name': name, 'email': email}
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/users'
+    payload = {
+        'name': name,
+        'email': email,
+    }
+    
+    # Password is optional - if not provided, user will need to reset password
+    if password:
+        payload['password'] = password
+    
+    response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code in [200, 201]:
+        return response.json()
+    else:
+        print(f'Error creating user: {response.status_code}')
+        print(response.text)
+        return None
+
+
+def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, owner_id=None, dryrun=False):
     """Create a new page in BookStack."""
     if dryrun:
         print(f'[DRYRUN] Would create page: {name} in book {book_id}')
@@ -658,17 +926,26 @@ def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, 
         payload['chapter_id'] = chapter_id
     if parent_id:
         payload['parent_id'] = parent_id
+    if owner_id:
+        payload['owned_by'] = owner_id
     
     response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
-        return response.json()
+        result = response.json()
+        # Debug: check if chapter was set
+        if chapter_id and result.get('chapter_id') != chapter_id:
+            print(f'  Warning: Requested chapter_id {chapter_id} but page has chapter_id {result.get("chapter_id")}')
+        # Debug: check if owner was set
+        if owner_id and result.get('owned_by') != owner_id:
+            print(f'  Warning: Requested owner_id {owner_id} but page has owner_id {result.get("owned_by")}')
+        return result
     else:
         print(f'Error creating page: {response.status_code}')
         print(response.text)
         return None
 
 
-def update_bookstack_page(page_id, name=None, html=None, parent_id=None, dryrun=False):
+def update_bookstack_page(page_id, name=None, html=None, parent_id=None, chapter_id=None, owner_id=None, dryrun=False):
     """Update an existing page in BookStack."""
     if dryrun:
         print(f'[DRYRUN] Would update page {page_id}')
@@ -691,6 +968,10 @@ def update_bookstack_page(page_id, name=None, html=None, parent_id=None, dryrun=
         payload['html'] = html
     if parent_id is not None:
         payload['parent_id'] = parent_id
+    if chapter_id is not None:
+        payload['chapter_id'] = chapter_id
+    if owner_id is not None:
+        payload['owned_by'] = owner_id
     
     if not payload:
         return True
@@ -700,9 +981,30 @@ def update_bookstack_page(page_id, name=None, html=None, parent_id=None, dryrun=
     
     response = requests.put(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
+        # Verify the update actually worked
+        if owner_id is not None:
+            updated_data = response.json()
+            if updated_data.get('owned_by') != owner_id:
+                print(f'  Warning: Update requested owner_id {owner_id} but page still has owner_id {updated_data.get("owned_by")}')
         return True
     else:
         print(f'Error updating page {page_id}: {response.status_code}')
+        print(response.text)
+        return False
+
+
+def delete_bookstack_chapter(chapter_id, dryrun=False):
+    """Delete a chapter from BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would delete chapter {chapter_id}')
+        return True
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/chapters/{chapter_id}'
+    response = requests.delete(url, headers=bookstack_headers)
+    if response.status_code in [200, 204]:
+        return True
+    else:
+        print(f'Error deleting chapter {chapter_id}: {response.status_code}')
         print(response.text)
         return False
 
@@ -724,9 +1026,10 @@ def delete_bookstack_page(page_id, dryrun=False):
 
 
 def delete_all_bookstack_pages(book_id=None, dryrun=False):
-    """Delete all pages from a BookStack book."""
+    """Delete all pages and chapters from a BookStack book."""
+    
     print('\n' + '=' * 60)
-    print('DELETE PAGES: Removing all pages from BookStack book')
+    print('DELETE CONTENT: Removing all pages and chapters from BookStack book')
     print('=' * 60)
     
     book_id = book_id or BOOKSTACK_BOOK_ID
@@ -735,48 +1038,112 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
         print('Error: BOOKSTACK_BOOK_ID must be specified')
         return
     
-    # Fetch all pages in the book
-    print(f'Fetching pages from book {book_id}...')
-    pages = fetch_bookstack_pages(book_id=book_id)
-    
-    if not pages:
-        print('No pages found in book.')
-        return
-    
-    print(f'Found {len(pages)} pages to delete.')
-    
     if dryrun:
-        print('\n[DRYRUN] Would delete the following pages:')
-        for page in pages:
-            print(f'  - Page {page["id"]}: {page["name"]}')
+        print('\n[DRYRUN] Would fetch and delete all chapters and pages')
         return
     
-    # Delete pages (process in reverse order to handle children first if needed)
-    deleted = 0
-    errors = 0
+    # Keep deleting until nothing remains
+    max_iterations = 10  # Safety limit
+    iteration = 0
     
-    # Sort by ID in reverse to potentially delete children before parents
-    # (though BookStack should handle this automatically)
-    pages_sorted = sorted(pages, key=lambda p: p.get('id', 0), reverse=True)
-    
-    for page in pages_sorted:
-        page_id = page['id']
-        page_name = page['name']
-        print(f'\nDeleting page {page_id}: {page_name[:50]}...')
+    while iteration < max_iterations:
+        iteration += 1
+        print(f'\n--- Iteration {iteration} ---')
         
-        if delete_bookstack_page(page_id, dryrun=False):
-            print(f'  Deleted page {page_id}')
-            deleted += 1
-        else:
-            errors += 1
+        # Fetch pages
+        print(f'Fetching pages from book {book_id}...')
+        pages = fetch_bookstack_pages(book_id=book_id)
+        
+        # Deduplicate pages by ID
+        seen_page_ids = set()
+        unique_pages = []
+        for page in pages:
+            page_id = page.get('id')
+            if page_id and page_id not in seen_page_ids:
+                seen_page_ids.add(page_id)
+                unique_pages.append(page)
+        
+        pages = unique_pages
+        print(f'Found {len(pages)} pages to delete.')
+        
+        # Delete pages
+        pages_deleted = 0
+        pages_errors = 0
+        
+        if pages:
+            pages_sorted = sorted(pages, key=lambda p: p.get('id', 0), reverse=True)
+            
+            for i, page in enumerate(pages_sorted, 1):
+                page_id = page['id']
+                page_name = page['name']
+                if i % 10 == 0 or i == len(pages_sorted):
+                    print(f'[{i}/{len(pages_sorted)}] Deleting page {page_id}: {page_name[:50]}...')
+                
+                if delete_bookstack_page(page_id, dryrun=False):
+                    pages_deleted += 1
+                else:
+                    pages_errors += 1
+                
+                # Rate limiting
+                if i % 10 == 0:
+                    time.sleep(1)
+                else:
+                    time.sleep(0.3)
+        
+        # Fetch chapters
+        print(f'\nFetching chapters from book {book_id}...')
+        chapters = fetch_bookstack_chapters(book_id)
+        
+        # Deduplicate chapters by ID
+        seen_chapter_ids = set()
+        unique_chapters = []
+        for chapter in chapters:
+            chapter_id = chapter.get('id')
+            if chapter_id and chapter_id not in seen_chapter_ids:
+                seen_chapter_ids.add(chapter_id)
+                unique_chapters.append(chapter)
+        
+        chapters = unique_chapters
+        print(f'Found {len(chapters)} chapters to delete.')
+        
+        # Delete chapters
+        chapters_deleted = 0
+        chapters_errors = 0
+        
+        if chapters:
+            chapters_sorted = sorted(chapters, key=lambda c: c.get('id', 0), reverse=True)
+            
+            for i, chapter in enumerate(chapters_sorted, 1):
+                chapter_id = chapter['id']
+                chapter_name = chapter['name']
+                if i % 10 == 0 or i == len(chapters_sorted):
+                    print(f'[{i}/{len(chapters_sorted)}] Deleting chapter {chapter_id}: {chapter_name[:50]}...')
+                
+                if delete_bookstack_chapter(chapter_id, dryrun=False):
+                    chapters_deleted += 1
+                else:
+                    chapters_errors += 1
+                
+                # Rate limiting
+                if i % 10 == 0:
+                    time.sleep(1)
+                else:
+                    time.sleep(0.3)
+        
+        # If nothing was found or deleted, we're done
+        if len(pages) == 0 and len(chapters) == 0:
+            print('\nNo more pages or chapters found. Deletion complete!')
+            break
+        
+        print(f'\nIteration {iteration} summary: Deleted {pages_deleted} pages, {chapters_deleted} chapters')
+        
+        # Small delay between iterations
+        time.sleep(1)
     
-    # Summary
     print('\n' + '=' * 60)
-    print('DELETE PAGES SUMMARY')
+    print('DELETE CONTENT COMPLETE')
     print('=' * 60)
-    print(f'Total pages: {len(pages)}')
-    print(f'Deleted: {deleted}')
-    print(f'Errors: {errors}')
+    print(f'Completed {iteration} iteration(s)')
 
 
 # =============================================================================
@@ -1100,10 +1467,140 @@ def list_jira_epics():
 
 
 # =============================================================================
+# Migration Functions - User Management
+# =============================================================================
+
+def load_user_email_mapping():
+    """Load user email mapping from user_map.json file."""
+    mapping = {}
+    user_map_file = os.path.join(os.path.dirname(__file__), 'user_map.json')
+    
+    if os.path.exists(user_map_file):
+        try:
+            with open(user_map_file, 'r') as f:
+                mapping = json.load(f)
+            print(f'Loaded {len(mapping)} user email mappings from user_map.json')
+        except Exception as e:
+            print(f'Warning: Could not load user_map.json: {e}')
+            print('  User email mapping will not be available.')
+    else:
+        print(f'Note: user_map.json not found. User email mapping will not be available.')
+        print(f'  Create user_map.json (see user_map.json.example) to map display names to emails.')
+    
+    return mapping
+
+
+def sync_users_to_bookstack(source='atlassian', dryrun=False, skip_existing=True):
+    """
+    Sync users from a source (atlassian or openproject) to BookStack.
+    
+    Args:
+        source: 'atlassian' or 'openproject'
+        dryrun: If True, don't actually create users
+        skip_existing: If True, skip users that already exist in BookStack (by email)
+    """
+    print('\n' + '=' * 60)
+    print(f'SYNC USERS: Migrating users from {source.upper()} to BookStack')
+    print('=' * 60)
+    
+    # Load user email mapping if available
+    user_email_mapping = load_user_email_mapping()
+    
+    # Fetch users from source
+    if source == 'atlassian':
+        source_users = fetch_atlassian_users()
+    elif source == 'openproject':
+        source_users = fetch_op_users()
+    else:
+        print(f'Error: Unknown source "{source}". Use "atlassian" or "openproject".')
+        return
+    
+    if not source_users:
+        print('No users found in source system.')
+        return
+    
+    # Fetch existing BookStack users
+    print('\nBuilding cache of existing BookStack users...')
+    bookstack_users = fetch_bookstack_users()
+    existing_by_email = {user.get('email', '').lower(): user for user in bookstack_users if user.get('email')}
+    
+    print(f'Found {len(existing_by_email)} existing users in BookStack.')
+    
+    # Process users
+    created = 0
+    skipped = 0
+    errors = 0
+    
+    for user in source_users:
+        if source == 'atlassian':
+            # Atlassian user format
+            user_key = user.get('userKey', user.get('accountId', ''))
+            display_name = user.get('displayName', user.get('name', 'Unknown'))
+            email = user.get('emailAddress', '')
+            if not email:
+                # Try alternative field names
+                email = user.get('email', '')
+            if not email:
+                # Use mapping from user_map.json if available
+                email = user_email_mapping.get(display_name, '')
+        elif source == 'openproject':
+            # OpenProject user format
+            user_id = user.get('id')
+            display_name = user.get('name', 'Unknown')
+            email = user.get('email', '')
+            if not email:
+                # Try login field
+                email = user.get('login', '')
+        
+        if not email:
+            print(f'  Skipping user "{display_name}" - no email address')
+            skipped += 1
+            continue
+        
+        email_lower = email.lower()
+        
+        # Check if already exists
+        if email_lower in existing_by_email and skip_existing:
+            print(f'  Skipping {display_name} ({email}) - already exists')
+            skipped += 1
+            continue
+        
+        if dryrun:
+            print(f'  [DRYRUN] Would create user: {display_name} ({email})')
+            created += 1
+        else:
+            # Create user in BookStack (without password - user will need to reset)
+            result = create_bookstack_user(
+                name=display_name,
+                email=email,
+                password=None,  # Don't set password - user can reset via email
+                dryrun=dryrun
+            )
+            if result:
+                print(f'  Created user: {display_name} ({email})')
+                created += 1
+                existing_by_email[email_lower] = result
+                time.sleep(0.3)  # Rate limit protection
+            else:
+                errors += 1
+    
+    # Summary
+    print('\n' + '=' * 60)
+    print('SYNC USERS SUMMARY')
+    print('=' * 60)
+    print(f'Total processed: {len(source_users)}')
+    print(f'Created: {created}')
+    print(f'Skipped: {skipped}')
+    print(f'Errors: {errors}')
+    
+    return existing_by_email
+
+
+# =============================================================================
 # Migration Functions - Confluence to BookStack
 # =============================================================================
 
-def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book_id=None):
+def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book_id=None, user_map=None):
     """Sync pages from Confluence to BookStack."""
     print('\n' + '=' * 60)
     print('SYNC PAGES: Migrating from Confluence to BookStack')
@@ -1124,6 +1621,25 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
     print(f'Fetching pages from Confluence space: {space_key}')
     confluence_pages = fetch_confluence_pages(space_key=space_key)
     
+    # Build user mapping if not provided
+    if user_map is None:
+        print('\nBuilding user mapping from BookStack users...')
+        bookstack_users = fetch_bookstack_users()
+        user_map = {user.get('email', '').lower(): user.get('id') for user in bookstack_users if user.get('email')}
+        print(f'Found {len(user_map)} users in BookStack for assignment.')
+    
+    # Also load user email mapping for display name fallback
+    user_email_mapping = load_user_email_mapping()
+    # Create reverse mapping: email -> BookStack user ID
+    email_to_user_id = {}
+    for email, user_id in user_map.items():
+        email_to_user_id[email] = user_id
+    # Also add mappings from user_map.json
+    for display_name, email in user_email_mapping.items():
+        email_lower = email.lower()
+        if email_lower in user_map:
+            email_to_user_id[email_lower] = user_map[email_lower]
+    
     # Build cache of existing BookStack pages
     print('\nBuilding cache of existing BookStack pages...')
     bookstack_pages = fetch_bookstack_pages(book_id=book_id)
@@ -1137,6 +1653,12 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
     
     print(f'Found {len(existing_by_confluence_id)} existing pages in BookStack.')
     
+    # Build cache of existing BookStack chapters to check for duplicate names
+    print('\nBuilding cache of existing BookStack chapters...')
+    existing_chapters = fetch_bookstack_chapters(book_id)
+    existing_chapter_names = {chapter['name'].lower(): chapter for chapter in existing_chapters}
+    print(f'Found {len(existing_chapter_names)} existing chapters in BookStack.')
+    
     # Process pages
     created = 0
     updated = 0
@@ -1145,7 +1667,24 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
     
     # Build a map of Confluence page IDs to pages for hierarchy
     confluence_pages_map = {page['id']: page for page in confluence_pages}
-    parent_map = {}  # Map Confluence page ID to BookStack page ID
+    
+    # Identify pages that have children (these will become chapters)
+    pages_with_children = set()
+    for page in confluence_pages:
+        page_id = page['id']
+        # Check if any other page has this page as an ancestor
+        for other_page in confluence_pages:
+            ancestors = other_page.get('ancestors', [])
+            if ancestors and ancestors[-1]['id'] == page_id:
+                pages_with_children.add(page_id)
+                break
+    
+    print(f'Found {len(pages_with_children)} pages with children (will become chapters)')
+    
+    # Maps for tracking what we've created
+    page_to_chapter_map = {}  # Map Confluence page ID -> BookStack chapter ID (for pages that became chapters)
+    page_to_page_map = {}     # Map Confluence page ID -> BookStack page ID (for intro pages in chapters)
+    chapter_map = {}           # Map Confluence page ID -> BookStack chapter ID
     
     # Sort pages by depth (root pages first)
     def get_depth(page):
@@ -1166,7 +1705,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         if existing_page and skip_existing:
             print(f'  Skipping - already exists as page {existing_page["id"]}')
             skipped += 1
-            parent_map[page_id] = existing_page['id']
+            page_to_page_map[page_id] = existing_page['id']
             continue
         
         # Get page content (HTML)
@@ -1178,83 +1717,229 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         if not html_content or html_content.strip() == '':
             html_content = '<p></p>'  # Empty paragraph to satisfy BookStack requirement
         
-        # Determine parent in BookStack
-        parent_bookstack_id = None
+        # Determine owner from page creator
+        owner_id = None
+        if user_map:
+            history = page.get('history', {})
+            created_by = history.get('createdBy', {})
+            
+            # Try multiple ways to extract email from Confluence API response
+            creator_email = None
+            if created_by:
+                # Try nested user object first
+                user_obj = created_by.get('user', {})
+                if user_obj:
+                    creator_email = user_obj.get('emailAddress', '') or user_obj.get('email', '')
+                
+                # If not found, try direct on createdBy
+                if not creator_email:
+                    creator_email = created_by.get('emailAddress', '') or created_by.get('email', '')
+                
+                # Try accountId and look up user
+                if not creator_email and created_by.get('accountId'):
+                    # Could potentially look up user by accountId, but email is preferred
+                    pass
+            
+            if creator_email:
+                owner_id = user_map.get(creator_email.lower())
+                if owner_id:
+                    print(f'  Assigned to user: {creator_email}')
+                else:
+                    # Debug: show what email we found but couldn't match
+                    print(f'  Could not match creator email: {creator_email} (not in user_map)')
+            else:
+                # If no email, try to match by display name using user_email_mapping
+                if created_by:
+                    display_name = created_by.get('displayName', '')
+                    # Remove "(Unlicensed)" suffix if present
+                    display_name = display_name.replace(' (Unlicensed)', '').strip()
+                    
+                    if display_name and display_name in user_email_mapping:
+                        mapped_email = user_email_mapping[display_name].lower()
+                        owner_id = user_map.get(mapped_email)
+                        if owner_id:
+                            print(f'  Assigned to user via display name mapping: {display_name} -> {mapped_email}')
+                        else:
+                            print(f'  Found display name "{display_name}" in mapping but email {mapped_email} not in BookStack users')
+                    else:
+                        # Debug: show that we couldn't find email or display name match
+                        print(f'  No email found and no display name match: {display_name}')
+        
+        # Determine parent chapter in BookStack by walking up the ancestor chain
+        # to find the nearest ancestor that became a chapter
+        parent_chapter_id = None
         ancestors = page.get('ancestors', [])
         if ancestors:
-            parent_confluence_id = ancestors[-1]['id']
-            # Try both string and int versions of the ID for lookup
-            parent_bookstack_id = parent_map.get(parent_confluence_id)
-            if not parent_bookstack_id:
-                parent_bookstack_id = parent_map.get(str(parent_confluence_id))
-            if not parent_bookstack_id and isinstance(parent_confluence_id, (str, int)):
-                try:
-                    alt_id = int(parent_confluence_id) if isinstance(parent_confluence_id, str) else str(parent_confluence_id)
-                    parent_bookstack_id = parent_map.get(alt_id)
-                except (ValueError, TypeError):
-                    pass
-            if parent_bookstack_id:
-                print(f'  Found parent: Confluence ID {parent_confluence_id} -> BookStack ID {parent_bookstack_id}')
-            else:
-                print(f'  Warning: Parent Confluence ID {parent_confluence_id} not found in parent_map (parent will be None)')
+            # Walk through ancestors from most recent (immediate parent) to oldest (root ancestor)
+            # We want to find the first ancestor that became a chapter
+            for ancestor in reversed(ancestors):
+                ancestor_id = ancestor.get('id')
+                if not ancestor_id:
+                    continue
+                
+                # Check if this ancestor became a chapter
+                found_chapter_id = chapter_map.get(ancestor_id)
+                if not found_chapter_id:
+                    # Try string/int variants
+                    found_chapter_id = chapter_map.get(str(ancestor_id))
+                if not found_chapter_id and isinstance(ancestor_id, (str, int)):
+                    try:
+                        alt_id = int(ancestor_id) if isinstance(ancestor_id, str) else str(ancestor_id)
+                        found_chapter_id = chapter_map.get(alt_id)
+                    except (ValueError, TypeError):
+                        pass
+                
+                if found_chapter_id:
+                    parent_chapter_id = found_chapter_id
+                    print(f'  Found ancestor chapter: Confluence ID {ancestor_id} -> BookStack Chapter ID {parent_chapter_id}')
+                    break
+            
+            if not parent_chapter_id:
+                # None of the ancestors became a chapter, this page will be at the book level
+                print(f'  No ancestor chapter found - page will be at book level')
         
-        if dryrun:
-            if existing_page:
-                print(f'  [DRYRUN] Would update page {existing_page["id"]}')
-                updated += 1
-            else:
-                print(f'  [DRYRUN] Would create new page (parent: {parent_bookstack_id})')
+        # If this page has children, it becomes a chapter
+        if page_id in pages_with_children:
+            # Check if a chapter with this name already exists
+            chapter_name = page_title
+            if chapter_name.lower() in existing_chapter_names:
+                # Get parent page name to prepend
+                parent_page_name = None
+                if ancestors:
+                    # Get the immediate parent (last in ancestors list)
+                    parent_ancestor = ancestors[-1]
+                    parent_page_id = parent_ancestor.get('id')
+                    if parent_page_id:
+                        parent_page = confluence_pages_map.get(parent_page_id)
+                        if parent_page:
+                            parent_page_name = parent_page.get('title', 'Parent')
+                
+                if parent_page_name:
+                    chapter_name = f"{parent_page_name} - {page_title}"
+                    print(f'  Chapter name "{page_title}" already exists, using "{chapter_name}"')
+                else:
+                    # Fallback if we can't find parent name
+                    chapter_name = f"Chapter - {page_title}"
+                    print(f'  Chapter name "{page_title}" already exists, using "{chapter_name}"')
+            
+            # Create a chapter for this page
+            if dryrun:
+                print(f'  [DRYRUN] Would create chapter "{chapter_name}" and intro page')
+                chapter_map[page_id] = 'dryrun_chapter_id'
+                chapter_map[str(page_id)] = 'dryrun_chapter_id'
                 created += 1
-            if not existing_page:
-                parent_map[page_id] = 'dryrun_id'
-            continue
-        
-        try:
-            if existing_page:
-                # Update existing (including parent relationship)
-                result = update_bookstack_page(existing_page['id'], name=page_title, html=html_content, parent_id=parent_bookstack_id, dryrun=dryrun)
-                if result:
-                    bookstack_page_id = existing_page['id']
-                    print(f'  Updated page {bookstack_page_id} (parent: {parent_bookstack_id})')
-                    updated += 1
-                    # Store both string and int versions of Confluence ID for lookup
-                    parent_map[page_id] = bookstack_page_id
-                    parent_map[str(page_id)] = bookstack_page_id
-                    if isinstance(page_id, str):
+            else:
+                # Create chapter
+                chapter_result = create_bookstack_chapter(
+                    name=chapter_name,
+                    description='',  # Could use page content summary
+                    book_id=book_id,
+                    dryrun=dryrun
+                )
+                if chapter_result:
+                    chapter_id = chapter_result.get('id')
+                    chapter_map[page_id] = chapter_id
+                    chapter_map[str(page_id)] = chapter_id
+                    if isinstance(page_id, (str, int)):
                         try:
-                            parent_map[int(page_id)] = bookstack_page_id
+                            alt_id = int(page_id) if isinstance(page_id, str) else str(page_id)
+                            chapter_map[alt_id] = chapter_id
                         except (ValueError, TypeError):
                             pass
+                    # Update existing chapters cache with the new chapter
+                    existing_chapter_names[chapter_name.lower()] = chapter_result
+                    print(f'  Created chapter {chapter_id} for "{chapter_name}"')
+                    if not dryrun:
+                        time.sleep(0.5)  # Rate limit protection
+                    
+                    # Create an "Introduction" page in this chapter with the parent page's content
+                    intro_result = create_bookstack_page(
+                        name='Introduction',
+                        html=html_content,
+                        book_id=book_id,
+                        chapter_id=chapter_id,
+                        owner_id=owner_id,
+                        dryrun=dryrun
+                    )
+                    if intro_result:
+                        intro_page_id = intro_result.get('id')
+                        print(f'  Created intro page {intro_page_id} in chapter {chapter_id}')
+                        page_to_page_map[page_id] = intro_page_id
+                        # Always update chapter_id and owner_id after creation, because BookStack API
+                        # may not properly set them during creation
+                        needs_update = False
+                        update_chapter_id = None
+                        update_owner_id = None
+                        if chapter_id:
+                            needs_update = True
+                            update_chapter_id = chapter_id
+                        if owner_id:
+                            needs_update = True
+                            update_owner_id = owner_id
+                        if needs_update:
+                            update_result = update_bookstack_page(
+                                intro_page_id,
+                                chapter_id=update_chapter_id,
+                                owner_id=update_owner_id,
+                                dryrun=dryrun
+                            )
+                            if update_result:
+                                if update_chapter_id:
+                                    print(f'  Updated intro page to chapter {update_chapter_id}')
+                                if update_owner_id:
+                                    print(f'  Updated intro page owner to user {update_owner_id}')
+                    created += 1
+                    if not dryrun:
+                        time.sleep(0.5)  # Rate limit protection
                 else:
                     errors += 1
+        else:
+            # This is a regular page (no children) - create it in the parent's chapter if it has one
+            if dryrun:
+                print(f'  [DRYRUN] Would create page in chapter {parent_chapter_id}')
+                created += 1
             else:
-                # Create new
                 result = create_bookstack_page(
                     name=page_title,
                     html=html_content,
                     book_id=book_id,
-                    parent_id=parent_bookstack_id,
+                    chapter_id=parent_chapter_id,  # Use chapter_id instead of parent_id
+                    owner_id=owner_id,
                     dryrun=dryrun
                 )
                 if result:
                     bookstack_page_id = result.get('id')
-                    print(f'  Created page {bookstack_page_id} (parent: {parent_bookstack_id})')
+                    print(f'  Created page {bookstack_page_id} in chapter {parent_chapter_id}')
+                    # Always update chapter_id and owner_id after creation, because BookStack API
+                    # may not properly set them during creation
+                    needs_update = False
+                    update_chapter_id = None
+                    update_owner_id = None
+                    if parent_chapter_id:
+                        needs_update = True
+                        update_chapter_id = parent_chapter_id
+                    if owner_id:
+                        needs_update = True
+                        update_owner_id = owner_id
+                    if needs_update:
+                        update_result = update_bookstack_page(
+                            bookstack_page_id, 
+                            chapter_id=update_chapter_id,
+                            owner_id=update_owner_id, 
+                            dryrun=dryrun
+                        )
+                        if update_result:
+                            if update_chapter_id:
+                                print(f'  Updated page to chapter {update_chapter_id}')
+                            if update_owner_id:
+                                print(f'  Updated page owner to user {update_owner_id}')
                     created += 1
-                    # Store both string and int versions of Confluence ID for lookup
-                    parent_map[page_id] = bookstack_page_id
-                    parent_map[str(page_id)] = bookstack_page_id
-                    if isinstance(page_id, (str, int)):
-                        try:
-                            alt_id = int(page_id) if isinstance(page_id, str) else str(page_id)
-                            parent_map[alt_id] = bookstack_page_id
-                        except (ValueError, TypeError):
-                            pass
+                    page_to_page_map[page_id] = bookstack_page_id
                     existing_by_confluence_id[page_title] = result
+                    if not dryrun:
+                        time.sleep(0.5)  # Rate limit protection
                 else:
                     errors += 1
-        except Exception as e:
-            print(f'  Error: {e}')
-            errors += 1
     
     # Summary
     print('\n' + '=' * 60)
@@ -1387,6 +2072,10 @@ Examples:
     mode_group.add_argument('--delete-pages', action='store_true',
                             help='Delete all pages from a BookStack book (Confluence only)')
     
+    # User sync mode (works with both jira and confluence)
+    mode_group.add_argument('--sync-users', action='store_true',
+                            help='Sync users to BookStack from specified source (use with --user-source)')
+    
     # Options
     parser.add_argument('--dryrun', action='store_true',
                         help='Preview changes without making them')
@@ -1394,6 +2083,8 @@ Examples:
                         help='Update existing items (default: skip)')
     parser.add_argument('--issues', type=str,
                         help='Comma-separated list of specific Jira issue keys to process')
+    parser.add_argument('--user-source', choices=['atlassian', 'openproject'],
+                        help='Source for user sync: atlassian (from Jira/Confluence) or openproject (from OpenProject). Required when using --sync-users.')
     
     args = parser.parse_args()
     
@@ -1433,6 +2124,39 @@ Examples:
         print('\n*** DRY RUN MODE - No changes will be made ***\n')
     
     # Execute selected mode
+    if args.sync_users:
+        # User sync works for both jira and confluence types
+        if not args.user_source:
+            print('Error: --user-source is required when using --sync-users')
+            print('  Use --user-source atlassian to import from Atlassian (Jira/Confluence)')
+            print('  Use --user-source openproject to import from OpenProject')
+            return 1
+        
+        # Validate BookStack credentials
+        if not all([BOOKSTACK_BASE_URL, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET]):
+            print('Error: BookStack credentials not configured in .env')
+            print('Required: BOOKSTACK_HOST, BOOKSTACK_TOKEN_ID, BOOKSTACK_TOKEN_SECRET')
+            return 1
+        
+        # Validate source credentials
+        if args.user_source == 'atlassian':
+            if not all([CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN]):
+                print('Error: Atlassian credentials not configured in .env')
+                print('Required: CONFLUENCE_HOST, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN')
+                return 1
+        elif args.user_source == 'openproject':
+            if not all([OP_BASE_URL, OP_API_KEY]):
+                print('Error: OpenProject credentials not configured in .env')
+                print('Required: OPENPROJECT_HOST, OPENPROJECT_API_KEY')
+                return 1
+        
+        sync_users_to_bookstack(
+            source=args.user_source,
+            dryrun=args.dryrun,
+            skip_existing=not args.update_existing
+        )
+        return 0
+    
     if migration_type == 'jira':
         if args.sync_issues:
             specific_keys = args.issues.split(',') if args.issues else None
@@ -1449,12 +2173,22 @@ Examples:
             list_jira_epics()
     
     elif migration_type == 'confluence':
+        # Build user map for page assignment if users are available
+        user_map = None
+        try:
+            bookstack_users = fetch_bookstack_users()
+            user_map = {user.get('email', '').lower(): user.get('id') for user in bookstack_users if user.get('email')}
+        except Exception as e:
+            print(f'Warning: Could not load user map: {e}')
+            print('  Pages will be created without owner assignment.')
+        
         if args.sync_pages:
             sync_confluence_pages(
                 dryrun=args.dryrun,
                 skip_existing=not args.update_existing,
                 space_key=CONFLUENCE_SPACE_KEY,
-                book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None
+                book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None,
+                user_map=user_map
             )
         elif args.sync_spaces:
             sync_confluence_spaces(
