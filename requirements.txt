@@ -12,3 +12,6 @@ fuzzywuzzy>=0.18.0
 # Levenshtein for faster fuzzy matching (optional but recommended)
 python-Levenshtein>=0.21.0
 
+# HTML parsing & Confluence macro normalization (code blocks -> <pre><code>)
+beautifulsoup4>=4.9
+

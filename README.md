@@ -16,7 +16,7 @@ A Python-based migration tool for transferring data between platforms:
 - **Page Migration**: Sync all pages from a Confluence space to BookStack
 - **Space Migration**: Convert Confluence spaces to BookStack shelves
 - **Hierarchy Preservation**: Maintains full hierarchy: Space → Shelf → Books (from top-level pages) → Chapters → Pages
-- **HTML Content**: Preserves formatted content from Confluence
+- **HTML Content**: Preserves formatted content from Confluence, including code blocks converted from Confluence "code" macros into proper `<pre><code>` blocks for BookStack
 - **User Assignment**: Assigns pages to correct users based on Confluence page creators
 
 ### Common Features
@@ -233,7 +233,7 @@ python migrate.py confluence --sync-pages --update-existing
 
 | Command | Description |
 |---------|-------------|
-| `python migrate.py confluence --sync-pages` | Migrate pages from Confluence to BookStack |
+| `python migrate.py confluence --sync-pages` | Migrate pages from Confluence to BookStack (HTML-only, with Confluence code macros converted to `<pre><code>` blocks) |
 | `python migrate.py confluence --sync-spaces` | Migrate Confluence spaces to BookStack books |
 | `python migrate.py confluence --delete-pages` | Delete all pages and chapters from a BookStack book |
 | `python migrate.py confluence --sync-users --user-source atlassian` | Import users from Atlassian to BookStack |
@@ -247,6 +247,8 @@ python migrate.py confluence --sync-pages --update-existing
 | `--update-existing` | Update existing items (default: skip) |
 | `--issues KEYS` | Comma-separated list of specific Jira issue keys |
 | `--user-source SOURCE` | Source for user sync: `atlassian` or `openproject` (required with `--sync-users`) |
+| `--page-id ID` | (Confluence `--sync-pages` only) Sync a single Confluence page by ID plus its ancestor hierarchy |
+| `--page-title TITLE` | (Confluence `--sync-pages` only) Sync only pages whose Confluence title exactly matches this value |
 
 ## Type Mappings (Jira to OpenProject)
 
@@ -304,6 +306,9 @@ The tool maps Jira issue types to OpenProject work package types:
 5. **Set Shelf ID** (recommended): Update `BOOKSTACK_SHELF_ID` in `.env` with the target shelf ID
    - Or **Set Book ID** (legacy): Update `BOOKSTACK_BOOK_ID` in `.env` for single-book mode
 6. **Preview Pages**: Run `python migrate.py confluence --sync-pages --dryrun` to preview
+   - To test a single Confluence page end-to-end (useful when validating code blocks), you can limit the sync:
+     - By title: `python migrate.py confluence --sync-pages --dryrun --page-title "Some Page Title"`
+     - By ID: `python migrate.py confluence --sync-pages --dryrun --page-id 1234567`
 7. **Migrate Pages**: Run `python migrate.py confluence --sync-pages` to migrate pages
 8. **Verify**: Check BookStack to confirm the migration and user assignments
 

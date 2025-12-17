@@ -27,6 +27,25 @@ import time
 from fuzzywuzzy import fuzz
 from enum import Enum
 
+# Optional HTML→Markdown conversion for pages with code blocks/tables
+try:
+    from markdownify import markdownify as _markdownify
+except ImportError:
+    _markdownify = None
+
+try:
+    from bs4 import BeautifulSoup
+    _beautifulsoup_available = True
+except ImportError:
+    BeautifulSoup = None
+    _beautifulsoup_available = False
+
+if _markdownify is None:
+    # This warning is helpful for Confluence → BookStack migrations where we
+    # want to emit markdown rather than HTML so that code blocks render well.
+    print('Warning: python package "markdownify" not installed; '
+          'Confluence pages will be sent to BookStack as HTML only.')
+
 load_dotenv()
 
 # =============================================================================
@@ -662,18 +681,78 @@ def fetch_atlassian_users():
     return detailed_users
 
 
+def _convert_confluence_macros_to_html(html):
+    """
+    Convert Confluence-specific macros (especially code macros) into plain HTML
+    that BookStack understands (e.g., <pre><code> blocks).
+    """
+    if not html:
+        return html
+    if not ('ac:structured-macro' in html and 'ac:name="code"' in html):
+        return html
+    if not (_beautifulsoup_available if 'BeautifulSoup' in globals() else False):
+        return html
+    
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Find all Confluence code macros
+        def is_code_macro(tag):
+            try:
+                return (
+                    isinstance(tag.name, str)
+                    and tag.name.lower() == 'ac:structured-macro'
+                    and tag.get('ac:name') == 'code'
+                )
+            except Exception:
+                return False
+        
+        for macro in list(soup.find_all(is_code_macro)):
+            # Default language is empty; we prefer bash if explicitly set
+            language = ''
+            for param in macro.find_all('ac:parameter'):
+                if param.get('ac:name') == 'language':
+                    language = (param.get_text() or '').strip()
+                    break
+            
+            body = macro.find('ac:plain-text-body')
+            if not body:
+                continue
+            code_text = body.get_text() or ''
+            # Confluence stores literal "\n" sequences in CDATA; turn into newlines
+            code_text = code_text.replace('\\n', '\n')
+            
+            # Build <pre><code> block
+            pre = soup.new_tag('pre')
+            code = soup.new_tag('code')
+            if language:
+                code['class'] = [f'language-{language}']
+            code.string = code_text
+            pre.append(code)
+            
+            macro.replace_with(pre)
+        
+        return str(soup)
+    except Exception as e:
+        print(f'  Warning: failed to convert Confluence macros to HTML: {e}')
+        return html
+
+
 def convert_atlassian_storage_to_html(storage):
     """Convert Atlassian Document Format (storage format) to HTML."""
     if not storage:
         return ''
     if isinstance(storage, str):
-        return storage
+        return _convert_confluence_macros_to_html(storage)
     
-    # If it's already HTML, return as-is
+    # If it's already HTML-like, normalize macros and return as-is
     if isinstance(storage, dict) and 'value' in storage:
-        return storage.get('value', '')
+        raw = storage.get('value', '')
+        return _convert_confluence_macros_to_html(raw)
     
-    return str(storage)
+    return _convert_confluence_macros_to_html(str(storage))
+
+
 
 
 # =============================================================================
@@ -983,8 +1062,11 @@ def create_bookstack_user(name, email, password=None, dryrun=False):
         return None
 
 
-def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, owner_id=None, dryrun=False):
-    """Create a new page in BookStack."""
+def create_bookstack_page(name, html=None, book_id=None, chapter_id=None, parent_id=None, owner_id=None, dryrun=False):
+    """Create a new page in BookStack.
+    
+    The ``html`` parameter should contain the page content as HTML.
+    """
     if dryrun:
         print(f'[DRYRUN] Would create page: {name} in book {book_id}')
         return {'id': 'dryrun_id', 'name': name}
@@ -992,8 +1074,8 @@ def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, 
     url = f'{BOOKSTACK_BASE_URL}/api/pages'
     payload = {
         'name': name,
-        'html': html,
         'book_id': book_id,
+        'html': html or '',
     }
     
     if chapter_id:
@@ -1686,7 +1768,7 @@ def sync_users_to_bookstack(source='atlassian', dryrun=False, skip_existing=True
 # Migration Functions - Confluence to BookStack
 # =============================================================================
 
-def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shelf_id=None, book_id=None, user_map=None):
+def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shelf_id=None, book_id=None, user_map=None, page_id=None, page_title=None):
     """
     Sync pages from Confluence to BookStack.
     
@@ -1761,8 +1843,22 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
         print(f'Using legacy single-book mode (book_id: {book_id})')
     
     # Fetch Confluence pages
-    print(f'Fetching pages from Confluence space: {space_key}')
-    confluence_pages = fetch_confluence_pages(space_key=space_key)
+    # Fetch Confluence pages
+    if page_id:
+        print(f'Fetching single Confluence page by ID: {page_id}')
+        confluence_pages = fetch_confluence_pages(page_id=page_id)
+    else:
+        print(f'Fetching pages from Confluence space: {space_key}')
+        confluence_pages = fetch_confluence_pages(space_key=space_key)
+
+    # Optional filter by title for faster iteration/testing
+    if page_title:
+        before_count = len(confluence_pages)
+        confluence_pages = [p for p in confluence_pages if p.get('title') == page_title]
+        print(f'Filtered pages by title "{page_title}": {len(confluence_pages)} of {before_count} remain')
+        if not confluence_pages:
+            print('Warning: No Confluence pages matched the requested title; nothing to sync.')
+            return
     
     # Build user mapping if not provided
     if user_map is None:
@@ -2370,7 +2466,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
         storage = body.get('storage', {})
         html_content = convert_atlassian_storage_to_html(storage)
         
-        # BookStack requires either HTML or markdown, so provide empty HTML if content is empty
+        # BookStack requires HTML content, so provide empty HTML if content is empty
         if not html_content or html_content.strip() == '':
             html_content = '<p></p>'  # Empty paragraph to satisfy BookStack requirement
         
@@ -2759,6 +2855,10 @@ Examples:
                         help='Comma-separated list of specific Jira issue keys to process')
     parser.add_argument('--user-source', choices=['atlassian', 'openproject'],
                         help='Source for user sync: atlassian (from Jira/Confluence) or openproject (from OpenProject). Required when using --sync-users.')
+    parser.add_argument('--page-id', type=str,
+                        help='Confluence page ID to sync (Confluence only, use with --sync-pages)')
+    parser.add_argument('--page-title', type=str,
+                        help='Confluence page title to sync (Confluence only, use with --sync-pages)')
     
     args = parser.parse_args()
     
@@ -2864,7 +2964,9 @@ Examples:
                 space_key=CONFLUENCE_SPACE_KEY,
                 shelf_id=int(BOOKSTACK_SHELF_ID) if BOOKSTACK_SHELF_ID else None,
                 book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None,
-                user_map=user_map
+                user_map=user_map,
+                page_id=args.page_id,
+                page_title=args.page_title
             )
         elif args.sync_spaces:
             sync_confluence_spaces(
