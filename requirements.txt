@@ -15,3 +15,6 @@ python-Levenshtein>=0.21.0
 # HTML parsing & Confluence macro normalization (code blocks -> <pre><code>)
 beautifulsoup4>=4.9
 
+# Image processing for compression/resizing large images before embedding
+Pillow>=9.0.0
+

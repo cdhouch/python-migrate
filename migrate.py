@@ -24,6 +24,7 @@ import argparse
 import tempfile
 import shutil
 import time
+import base64
 from fuzzywuzzy import fuzz
 from enum import Enum
 
@@ -39,6 +40,16 @@ try:
 except ImportError:
     BeautifulSoup = None
     _beautifulsoup_available = False
+
+# Optional image processing for compression/resizing
+try:
+    from PIL import Image
+    import io
+    _pillow_available = True
+except ImportError:
+    Image = None
+    io = None
+    _pillow_available = False
 
 if _markdownify is None:
     # This warning is helpful for Confluence → BookStack migrations where we
@@ -525,7 +536,7 @@ def fetch_confluence_spaces(space_key=None):
         return spaces
 
 
-def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors,space,history'):
+def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors,space,history,children.attachment'):
     """Fetch pages and folders from Confluence. Can fetch all content in a space or a specific item."""
     if page_id:
         url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content/{page_id}'
@@ -681,6 +692,183 @@ def fetch_atlassian_users():
     return detailed_users
 
 
+def _compress_image(image_data, content_type, max_size_mb=5, max_dimension=1920):
+    """
+    Compress and/or resize an image if it's too large.
+    
+    Args:
+        image_data: Raw image bytes
+        content_type: MIME type of the image
+        max_size_mb: Maximum size in MB (raw, before base64) - default 5MB
+        max_dimension: Maximum width/height in pixels - default 1920px
+    
+    Returns:
+        (compressed_image_data, content_type) or (original_data, content_type) if compression fails
+    """
+    if not _pillow_available:
+        return image_data, content_type
+    
+    # Check if image is already small enough
+    size_mb = len(image_data) / (1024 * 1024)
+    if size_mb <= max_size_mb:
+        return image_data, content_type
+    
+    try:
+        # Open image with PIL
+        img = Image.open(io.BytesIO(image_data))
+        original_format = img.format
+        
+        # Resize if too large
+        width, height = img.size
+        if width > max_dimension or height > max_dimension:
+            ratio = min(max_dimension / width, max_dimension / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f'    Resized image from {width}x{height} to {new_width}x{new_height}')
+        
+        # Convert to RGB if necessary (for JPEG)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create white background for transparency
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Compress to JPEG with quality based on original size
+        output = io.BytesIO()
+        quality = 85  # Start with good quality
+        if size_mb > 10:
+            quality = 75
+        elif size_mb > 20:
+            quality = 65
+        
+        img.save(output, format='JPEG', quality=quality, optimize=True)
+        compressed_data = output.getvalue()
+        compressed_size_mb = len(compressed_data) / (1024 * 1024)
+        
+        if compressed_size_mb < size_mb:
+            print(f'    Compressed image from {size_mb:.2f}MB to {compressed_size_mb:.2f}MB')
+            return compressed_data, 'image/jpeg'
+        else:
+            # Compression didn't help, return original
+            return image_data, content_type
+    except Exception as e:
+        print(f'    Warning: Failed to compress image: {e}')
+        return image_data, content_type
+
+
+def _download_confluence_image(image_url, page_id=None):
+    """
+    Download an image from Confluence.
+    Returns (image_data, content_type) or (None, None) on failure.
+    """
+    try:
+        # Handle relative URLs
+        if image_url.startswith('/'):
+            image_url = f'https://{CONFLUENCE_BASE_URL}{image_url}'
+        elif not image_url.startswith('http'):
+            # Relative URL, construct full path
+            if page_id:
+                image_url = f'https://{CONFLUENCE_BASE_URL}/wiki/download/attachments/{page_id}/{image_url}'
+            else:
+                image_url = f'https://{CONFLUENCE_BASE_URL}/wiki{image_url}'
+        
+        response = requests.get(image_url, auth=confluence_auth, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        content_type = response.headers.get('content-type', 'image/png')
+        # Only download images
+        if not content_type.startswith('image/'):
+            return None, None
+        
+        image_data = response.content
+        
+        # Compress/resize if too large (before base64 encoding)
+        image_data, content_type = _compress_image(image_data, content_type)
+        
+        return image_data, content_type
+    except Exception as e:
+        print(f'    Warning: Failed to download image {image_url}: {e}')
+        return None, None
+
+
+def _convert_confluence_images_to_html(html, page_id=None):
+    """
+    Convert Confluence image references to BookStack-compatible format.
+    Downloads images and converts them to base64 data URIs for embedding.
+    """
+    if not html or not _beautifulsoup_available:
+        return html
+    
+    if not ('<ac:image' in html.lower() or '/wiki/download/attachments/' in html.lower() or 
+            '<img' in html.lower()):
+        return html
+    
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        images_processed = 0
+        
+        # Handle <ac:image> macros
+        for ac_image in soup.find_all('ac:image'):
+            # Try to find the attachment reference
+            ri_attachment = ac_image.find('ri:attachment')
+            if ri_attachment:
+                filename = ri_attachment.get('ri:filename', '')
+                if filename:
+                    # Download the image
+                    image_url = f'/wiki/download/attachments/{page_id}/{filename}'
+                    image_data, content_type = _download_confluence_image(image_url, page_id)
+                    if image_data:
+                        # Convert to base64 data URI
+                        base64_data = base64.b64encode(image_data).decode('utf-8')
+                        data_uri = f'data:{content_type};base64,{base64_data}'
+                        
+                        # Replace with <img> tag
+                        img_tag = soup.new_tag('img', src=data_uri, alt=filename)
+                        if ac_image.get('ac:align'):
+                            img_tag['style'] = f'text-align: {ac_image.get("ac:align")};'
+                        ac_image.replace_with(img_tag)
+                        images_processed += 1
+        
+        # Handle <img> tags with Confluence URLs
+        for img_tag in soup.find_all('img'):
+            src = img_tag.get('src', '')
+            if not src:
+                continue
+            
+            # Check if it's a Confluence URL
+            if '/wiki/download/attachments/' in src or src.startswith('/wiki/'):
+                # Extract filename from URL
+                if '/wiki/download/attachments/' in src:
+                    parts = src.split('/wiki/download/attachments/')
+                    if len(parts) > 1:
+                        rest = parts[1]
+                        # Format: PAGE_ID/filename or SPACE_KEY/PAGE_ID/filename
+                        path_parts = rest.split('/')
+                        filename = path_parts[-1]
+                        
+                        # Download the image
+                        image_data, content_type = _download_confluence_image(src, page_id)
+                        if image_data:
+                            # Convert to base64 data URI
+                            base64_data = base64.b64encode(image_data).decode('utf-8')
+                            data_uri = f'data:{content_type};base64,{base64_data}'
+                            img_tag['src'] = data_uri
+                            images_processed += 1
+        
+        if images_processed > 0:
+            print(f'  Converted {images_processed} image(s) to embedded format')
+        
+        return str(soup)
+    except Exception as e:
+        print(f'  Warning: failed to convert Confluence images: {e}')
+        return html
+
+
 def _convert_confluence_macros_to_html(html):
     """
     Convert Confluence-specific macros (especially code macros) into plain HTML
@@ -738,19 +926,32 @@ def _convert_confluence_macros_to_html(html):
         return html
 
 
-def convert_atlassian_storage_to_html(storage):
-    """Convert Atlassian Document Format (storage format) to HTML."""
+def convert_atlassian_storage_to_html(storage, page_id=None):
+    """
+    Convert Atlassian Document Format (storage format) to HTML.
+    
+    Args:
+        storage: The storage format from Confluence API
+        page_id: Optional Confluence page ID for resolving image attachments
+    """
     if not storage:
         return ''
+    
+    # First convert macros (code blocks)
+    html = None
     if isinstance(storage, str):
-        return _convert_confluence_macros_to_html(storage)
-    
-    # If it's already HTML-like, normalize macros and return as-is
-    if isinstance(storage, dict) and 'value' in storage:
+        html = _convert_confluence_macros_to_html(storage)
+    elif isinstance(storage, dict) and 'value' in storage:
         raw = storage.get('value', '')
-        return _convert_confluence_macros_to_html(raw)
+        html = _convert_confluence_macros_to_html(raw)
+    else:
+        html = _convert_confluence_macros_to_html(str(storage))
     
-    return _convert_confluence_macros_to_html(str(storage))
+    # Then convert images (needs page_id for attachment downloads)
+    if html and page_id:
+        html = _convert_confluence_images_to_html(html, page_id)
+    
+    return html
 
 
 
@@ -841,54 +1042,65 @@ def fetch_bookstack_books(book_id=None):
 
 
 def fetch_bookstack_pages(book_id=None):
-    """Fetch pages from BookStack. If book_id is provided, filter by that book."""
+    """Fetch pages from BookStack. If book_id is provided, filter by that book.
+
+    Note: BookStack's API paginates using ``count`` + ``offset``. Earlier
+    versions of this function used a ``page`` parameter which the API ignores
+    for the pages endpoint, causing the **first 100 results to be repeated**
+    on every request. That looked like 500 pages in logs but only ~100 unique
+    IDs in practice.
+
+    This implementation correctly paginates with an offset so we truly iterate
+    over all pages in the system.
+    """
     url = f'{BOOKSTACK_BASE_URL}/api/pages'
     pages = []
-    page = 1
     per_page = 100
-    
-    # Convert book_id to int for comparison
+    offset = 0
+
+    # Convert book_id to int for comparison in logs
     book_id_int = int(book_id) if book_id else None
     api_total = None  # Will be set from first API response
-    
+
     while True:
-        params = {'count': per_page, 'page': page}
+        params = {'count': per_page, 'offset': offset}
         # Use book_id in API call - the API filter works correctly
         if book_id:
             params['book_id'] = book_id  # Use original (string) value, API accepts it
-        
+
         response = requests.get(url, headers=bookstack_headers, params=params)
         response.raise_for_status()
         data = response.json()
-        
+
         # Get total from API response (first time only)
         if api_total is None:
             api_total = data.get('total', 0)
             if api_total > 0:
                 print(f'API reports {api_total} total pages for book {book_id}')
-        
+
         page_batch = data.get('data', [])
-        
+
         # Add all pages from this batch (API already filtered by book_id)
         pages.extend(page_batch)
-        
+
         # Stop if we got fewer results than requested (end of pages)
         if len(page_batch) < per_page:
             break
-        
+
         # Also stop if we've fetched at least as many as the API says exist
         if api_total and len(pages) >= api_total:
             break
-        
-        page += 1
-        
+
+        # Advance offset for next batch
+        offset += per_page
+
         # Small delay to avoid rate limiting (adaptive)
         adaptive_sleep()
         if book_id_int:
             print(f'Fetched {len(pages)} pages from book {book_id_int} so far...')
         else:
             print(f'Fetched {len(pages)} pages so far...')
-    
+
     print(f'Found {len(pages)} pages in BookStack.')
     return pages
 
@@ -963,14 +1175,16 @@ def fetch_bookstack_chapters(book_id):
     """Fetch all chapters from a BookStack book."""
     url = f'{BOOKSTACK_BASE_URL}/api/chapters'
     chapters = []
-    page = 1
+    offset = 0
     per_page = 100
     
     book_id_int = int(book_id) if book_id else None
     api_total = None
     
     while True:
-        params = {'count': per_page, 'page': page, 'book_id': book_id}
+        params = {'count': per_page, 'offset': offset}
+        if book_id:
+            params['book_id'] = book_id
         response = requests.get(url, headers=bookstack_headers, params=params)
         
         # Handle rate limiting
@@ -995,15 +1209,16 @@ def fetch_bookstack_chapters(book_id):
         
         chapters.extend(chapter_batch)
         
-        # Stop if we've fetched all chapters according to API total
-        if api_total and len(chapters) >= api_total:
-            break
-        
-        # Also stop if we got fewer results than requested (end of chapters)
+        # Stop if we got fewer results than requested (end of chapters)
         if len(chapter_batch) < per_page:
             break
         
-        page += 1
+        # Also stop if we've fetched at least as many as the API says exist
+        if api_total and len(chapters) >= api_total:
+            break
+        
+        # Advance offset for next batch
+        offset += per_page
         
         # Rate limiting - small delay between requests (adaptive)
         adaptive_sleep()
@@ -2464,7 +2679,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
         # Get page content (HTML)
         body = page.get('body', {})
         storage = body.get('storage', {})
-        html_content = convert_atlassian_storage_to_html(storage)
+        html_content = convert_atlassian_storage_to_html(storage, page_id=page_id)
         
         # BookStack requires HTML content, so provide empty HTML if content is empty
         if not html_content or html_content.strip() == '':
