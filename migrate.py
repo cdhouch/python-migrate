@@ -107,7 +107,8 @@ CONFLUENCE_SPACE_KEY = os.getenv('CONFLUENCE_SPACE_KEY')  # e.g., 'SPACE'
 BOOKSTACK_BASE_URL = os.getenv('BOOKSTACK_HOST')  # e.g., 'https://bookstack.example.com'
 BOOKSTACK_TOKEN_ID = os.getenv('BOOKSTACK_TOKEN_ID')
 BOOKSTACK_TOKEN_SECRET = os.getenv('BOOKSTACK_TOKEN_SECRET')
-BOOKSTACK_BOOK_ID = os.getenv('BOOKSTACK_BOOK_ID')  # Optional: specific book ID
+BOOKSTACK_BOOK_ID = os.getenv('BOOKSTACK_BOOK_ID')  # Optional: specific book ID (legacy, for direct book migration)
+BOOKSTACK_SHELF_ID = os.getenv('BOOKSTACK_SHELF_ID')  # Optional: specific shelf ID (for space migration)
 
 # Authentication
 confluence_auth = (CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN)
@@ -650,9 +651,37 @@ def fetch_bookstack_shelves():
     url = f'{BOOKSTACK_BASE_URL}/api/shelves'
     response = requests.get(url, headers=bookstack_headers)
     response.raise_for_status()
-    _bookstack_shelves_cache = {s['name']: s['id'] for s in response.json()['data']}
+    shelves = response.json().get('data', [])
+    _bookstack_shelves_cache = {s['name']: s for s in shelves}
     print(f'Loaded {len(_bookstack_shelves_cache)} shelves from BookStack.')
     return _bookstack_shelves_cache
+
+
+def create_bookstack_shelf(name, description='', dryrun=False):
+    """Create a new shelf in BookStack."""
+    if dryrun:
+        print(f'[DRYRUN] Would create shelf: {name}')
+        return {'id': 'dryrun_shelf_id', 'name': name}
+    
+    url = f'{BOOKSTACK_BASE_URL}/api/shelves'
+    payload = {
+        'name': name,
+        'description': description or '',
+    }
+    
+    response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code in [200, 201]:
+        result = response.json()
+        # Update cache
+        global _bookstack_shelves_cache
+        if _bookstack_shelves_cache is None:
+            _bookstack_shelves_cache = {}
+        _bookstack_shelves_cache[result['name']] = result
+        return result
+    else:
+        print(f'Error creating shelf: {response.status_code}')
+        print(response.text)
+        return None
 
 
 def fetch_bookstack_books(book_id=None):
@@ -1600,22 +1629,39 @@ def sync_users_to_bookstack(source='atlassian', dryrun=False, skip_existing=True
 # Migration Functions - Confluence to BookStack
 # =============================================================================
 
-def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book_id=None, user_map=None):
-    """Sync pages from Confluence to BookStack."""
+def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shelf_id=None, book_id=None, user_map=None):
+    """
+    Sync pages from Confluence to BookStack.
+    
+    New hierarchy: Space -> Shelf, Top-level pages -> Books, Pages -> Chapters/Pages
+    If shelf_id is provided, uses new hierarchy. If book_id is provided, uses legacy single-book mode.
+    """
     print('\n' + '=' * 60)
     print('SYNC PAGES: Migrating from Confluence to BookStack')
     print('=' * 60)
     
     space_key = space_key or CONFLUENCE_SPACE_KEY
+    shelf_id = shelf_id or BOOKSTACK_SHELF_ID
     book_id = book_id or BOOKSTACK_BOOK_ID
     
     if not space_key:
         print('Error: CONFLUENCE_SPACE_KEY must be specified')
         return
     
-    if not book_id:
-        print('Error: BOOKSTACK_BOOK_ID must be specified')
+    # Determine which mode to use
+    use_shelf_mode = shelf_id is not None
+    use_legacy_mode = book_id is not None
+    
+    if not use_shelf_mode and not use_legacy_mode:
+        print('Error: Either BOOKSTACK_SHELF_ID or BOOKSTACK_BOOK_ID must be specified')
+        print('  Use BOOKSTACK_SHELF_ID for new hierarchy (Space->Shelf->Books->Chapters->Pages)')
+        print('  Use BOOKSTACK_BOOK_ID for legacy mode (Space->Book->Chapters->Pages)')
         return
+    
+    if use_shelf_mode:
+        print(f'Using shelf-based hierarchy (shelf_id: {shelf_id})')
+    else:
+        print(f'Using legacy single-book mode (book_id: {book_id})')
     
     # Fetch Confluence pages
     print(f'Fetching pages from Confluence space: {space_key}')
@@ -1640,22 +1686,140 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
         if email_lower in user_map:
             email_to_user_id[email_lower] = user_map[email_lower]
     
-    # Build cache of existing BookStack pages
-    print('\nBuilding cache of existing BookStack pages...')
-    bookstack_pages = fetch_bookstack_pages(book_id=book_id)
-    existing_by_confluence_id = {}
+    # Build a map of Confluence page IDs to pages for hierarchy
+    confluence_pages_map = {page['id']: page for page in confluence_pages}
     
-    # Simple mapping - in production, you'd store Confluence ID in page metadata
-    # For now, we'll match by title (name)
+    # For shelf mode: Identify top-level pages (pages with no ancestors) - these become books
+    top_level_pages = []
+    page_to_book_map = {}  # Map Confluence page ID -> BookStack book ID
+    
+    if use_shelf_mode:
+        print('\nIdentifying top-level pages (these will become books)...')
+        for page in confluence_pages:
+            ancestors = page.get('ancestors', [])
+            if not ancestors:
+                top_level_pages.append(page)
+                print(f'  Top-level page: {page["title"]} (ID: {page["id"]})')
+        
+        print(f'\nFound {len(top_level_pages)} top-level pages. Creating books in shelf {shelf_id}...')
+        
+        # Fetch existing books in the shelf
+        all_existing_books = fetch_bookstack_books()
+        existing_books_by_name = {book['name']: book for book in all_existing_books if book.get('shelf_id') == int(shelf_id)}
+        
+        # Create a book for each top-level page
+        for top_page in top_level_pages:
+            page_id = top_page['id']
+            page_title = top_page['title']
+            
+            # Check if book already exists
+            existing_book = existing_books_by_name.get(page_title)
+            if existing_book and skip_existing:
+                print(f'  Book "{page_title}" already exists (ID: {existing_book["id"]})')
+                page_to_book_map[page_id] = existing_book['id']
+                continue
+            
+            if dryrun:
+                print(f'  [DRYRUN] Would create book "{page_title}" in shelf {shelf_id}')
+                page_to_book_map[page_id] = 'dryrun_book_id'
+            else:
+                result = create_bookstack_book(
+                    name=page_title,
+                    description='',  # Could extract from page content if needed
+                    shelf_id=int(shelf_id),
+                    dryrun=dryrun
+                )
+                if result:
+                    book_id = result['id']
+                    print(f'  Created book "{page_title}" (ID: {book_id}) in shelf {shelf_id}')
+                    # BookStack requires updating the shelf to include the book, not setting shelf_id on the book
+                    # Get current shelf data
+                    shelf_url = f'{BOOKSTACK_BASE_URL}/api/shelves/{shelf_id}'
+                    shelf_response = requests.get(shelf_url, headers=bookstack_headers)
+                    if shelf_response.status_code == 200:
+                        shelf_data = shelf_response.json()
+                        # Get existing books in the shelf
+                        existing_book_ids = [b.get('id') for b in shelf_data.get('books', [])]
+                        if book_id not in existing_book_ids:
+                            existing_book_ids.append(book_id)
+                            # Update shelf with the new book
+                            update_payload = {
+                                'name': shelf_data.get('name', ''),
+                                'description': shelf_data.get('description', ''),
+                                'books': existing_book_ids
+                            }
+                            update_response = requests.put(shelf_url, headers=bookstack_headers, json=update_payload)
+                            if update_response.status_code in [200, 201]:
+                                print(f'  Added book to shelf {shelf_id}')
+                            else:
+                                print(f'  Warning: Could not add book to shelf: {update_response.status_code} - {update_response.text}')
+                    else:
+                        print(f'  Warning: Could not fetch shelf data: {shelf_response.status_code}')
+                    page_to_book_map[page_id] = book_id
+                    time.sleep(0.5)  # Rate limit protection
+                else:
+                    print(f'  Error creating book for "{page_title}"')
+        
+        # Map all pages to their book (based on top-level ancestor)
+        print('\nMapping pages to their books...')
+        for page in confluence_pages:
+            page_id = page['id']
+            ancestors = page.get('ancestors', [])
+            
+            # Find the top-level ancestor (first in ancestors list, or self if no ancestors)
+            if not ancestors:
+                # This is a top-level page, use its own book
+                page_to_book_map[page_id] = page_to_book_map.get(page_id)
+            else:
+                # Find the root ancestor (first in ancestors list)
+                root_ancestor_id = ancestors[0]['id']
+                # Walk up to find the top-level page
+                current_id = root_ancestor_id
+                while current_id in confluence_pages_map:
+                    current_page = confluence_pages_map[current_id]
+                    current_ancestors = current_page.get('ancestors', [])
+                    if not current_ancestors:
+                        # Found the top-level page
+                        if current_id in page_to_book_map:
+                            page_to_book_map[page_id] = page_to_book_map[current_id]
+                        break
+                    else:
+                        current_id = current_ancestors[0]['id']
+        
+        print(f'Mapped {len([p for p in page_to_book_map.values() if p])} pages to books')
+    
+    # Build cache of existing BookStack pages (for all books if shelf mode, or single book if legacy)
+    print('\nBuilding cache of existing BookStack pages...')
+    if use_shelf_mode:
+        # Fetch pages from all books in the shelf
+        all_existing_books = fetch_bookstack_books()
+        all_books = [b['id'] for b in all_existing_books if b.get('shelf_id') == int(shelf_id)]
+        all_books.extend([b for b in page_to_book_map.values() if isinstance(b, int)])
+        all_books = list(set(all_books))  # Deduplicate
+        
+        bookstack_pages = []
+        for book_id in all_books:
+            pages = fetch_bookstack_pages(book_id=str(book_id))
+            bookstack_pages.extend(pages)
+    else:
+        bookstack_pages = fetch_bookstack_pages(book_id=book_id)
+    
+    existing_by_confluence_id = {}
     for page in bookstack_pages:
-        # You might want to store Confluence ID in the page HTML as a comment
         existing_by_confluence_id[page['name']] = page
     
     print(f'Found {len(existing_by_confluence_id)} existing pages in BookStack.')
     
-    # Build cache of existing BookStack chapters to check for duplicate names
+    # Build cache of existing BookStack chapters
     print('\nBuilding cache of existing BookStack chapters...')
-    existing_chapters = fetch_bookstack_chapters(book_id)
+    if use_shelf_mode:
+        existing_chapters = []
+        for book_id in all_books:
+            chapters = fetch_bookstack_chapters(book_id)
+            existing_chapters.extend(chapters)
+    else:
+        existing_chapters = fetch_bookstack_chapters(book_id)
+    
     existing_chapter_names = {chapter['name'].lower(): chapter for chapter in existing_chapters}
     print(f'Found {len(existing_chapter_names)} existing chapters in BookStack.')
     
@@ -1765,6 +1929,17 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
                         # Debug: show that we couldn't find email or display name match
                         print(f'  No email found and no display name match: {display_name}')
         
+        # Determine which book this page belongs to
+        target_book_id = None
+        if use_shelf_mode:
+            target_book_id = page_to_book_map.get(page_id)
+            if not target_book_id:
+                print(f'  Warning: Could not determine book for page {page_id}, skipping')
+                errors += 1
+                continue
+        else:
+            target_book_id = book_id
+        
         # Determine parent chapter in BookStack by walking up the ancestor chain
         # to find the nearest ancestor that became a chapter
         parent_chapter_id = None
@@ -1833,7 +2008,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
                 chapter_result = create_bookstack_chapter(
                     name=chapter_name,
                     description='',  # Could use page content summary
-                    book_id=book_id,
+                    book_id=target_book_id,
                     dryrun=dryrun
                 )
                 if chapter_result:
@@ -1856,7 +2031,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
                     intro_result = create_bookstack_page(
                         name='Introduction',
                         html=html_content,
-                        book_id=book_id,
+                        book_id=target_book_id,
                         chapter_id=chapter_id,
                         owner_id=owner_id,
                         dryrun=dryrun
@@ -1902,7 +2077,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
                 result = create_bookstack_page(
                     name=page_title,
                     html=html_content,
-                    book_id=book_id,
+                    book_id=target_book_id,
                     chapter_id=parent_chapter_id,  # Use chapter_id instead of parent_id
                     owner_id=owner_id,
                     dryrun=dryrun
@@ -1952,59 +2127,65 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, book
     print(f'Errors: {errors}')
 
 
-def sync_confluence_spaces(dryrun=False, skip_existing=True):
-    """Sync spaces from Confluence to BookStack (as books)."""
+def sync_confluence_spaces(dryrun=False, skip_existing=True, space_key=None):
+    """Sync a specific Confluence space to BookStack (as a shelf)."""
     print('\n' + '=' * 60)
-    print('SYNC SPACES: Migrating Confluence spaces to BookStack books')
+    print('SYNC SPACES: Migrating Confluence space to BookStack shelf')
     print('=' * 60)
     
-    # Fetch Confluence spaces
-    confluence_spaces = fetch_confluence_spaces()
+    space_key = space_key or CONFLUENCE_SPACE_KEY
     
-    # Build cache of existing BookStack books
-    print('\nBuilding cache of existing BookStack books...')
-    bookstack_books = fetch_bookstack_books()
-    existing_by_name = {book['name']: book for book in bookstack_books}
-    print(f'Found {len(existing_by_name)} existing books in BookStack.')
+    if not space_key:
+        print('Error: CONFLUENCE_SPACE_KEY must be specified in .env or as parameter')
+        return
     
-    # Process spaces
+    # Fetch the specific Confluence space
+    confluence_spaces = fetch_confluence_spaces(space_key=space_key)
+    
+    if not confluence_spaces:
+        print(f'Error: Space {space_key} not found in Confluence')
+        return
+    
+    # Build cache of existing BookStack shelves
+    print('\nBuilding cache of existing BookStack shelves...')
+    bookstack_shelves = fetch_bookstack_shelves()
+    existing_by_name = {name: shelf for name, shelf in bookstack_shelves.items()}
+    print(f'Found {len(existing_by_name)} existing shelves in BookStack.')
+    
+    # Process the single space
+    space = confluence_spaces[0]  # We only have one space
+    space_key = space['key']
+    space_name = space['name']
+    space_description = space.get('description', {}).get('plain', {}).get('value', '')
+    
+    print(f'\nProcessing space {space_key}: {space_name}...')
+    
+    # Check if already exists
+    existing_shelf = existing_by_name.get(space_name)
+    
     created = 0
     skipped = 0
     errors = 0
     
-    for space in confluence_spaces:
-        space_key = space['key']
-        space_name = space['name']
-        space_description = space.get('description', {}).get('plain', {}).get('value', '')
-        
-        print(f'\nProcessing space {space_key}: {space_name}...')
-        
-        # Check if already exists
-        existing_book = existing_by_name.get(space_name)
-        
-        if existing_book and skip_existing:
-            print(f'  Skipping - already exists as book {existing_book["id"]}')
-            skipped += 1
-            continue
-        
-        if dryrun:
-            if existing_book:
-                print(f'  [DRYRUN] Would update book {existing_book["id"]}')
-            else:
-                print(f'  [DRYRUN] Would create new book: {space_name}')
-            created += 1
-            continue
-        
+    if existing_shelf and skip_existing:
+        print(f'  Skipping - already exists as shelf {existing_shelf["id"]}')
+        skipped += 1
+    elif dryrun:
+        if existing_shelf:
+            print(f'  [DRYRUN] Would update shelf {existing_shelf["id"]}')
+        else:
+            print(f'  [DRYRUN] Would create new shelf: {space_name}')
+        created += 1
+    else:
         try:
-            result = create_bookstack_book(
+            result = create_bookstack_shelf(
                 name=space_name,
                 description=space_description,
                 dryrun=dryrun
             )
             if result:
-                print(f'  Created book {result["id"]}')
+                print(f'  Created shelf {result["id"]}')
                 created += 1
-                existing_by_name[space_name] = result
             else:
                 errors += 1
         except Exception as e:
@@ -2015,7 +2196,7 @@ def sync_confluence_spaces(dryrun=False, skip_existing=True):
     print('\n' + '=' * 60)
     print('SYNC SPACES SUMMARY')
     print('=' * 60)
-    print(f'Total processed: {len(confluence_spaces)}')
+    print(f'Space processed: {space_name}')
     print(f'Created: {created}')
     print(f'Skipped: {skipped}')
     print(f'Errors: {errors}')
@@ -2118,7 +2299,8 @@ Examples:
             return 1
         
         print(f'Confluence Space Key: {CONFLUENCE_SPACE_KEY or "Not set"}')
-        print(f'BookStack Book ID: {BOOKSTACK_BOOK_ID or "Not set"}')
+        print(f'BookStack Shelf ID: {BOOKSTACK_SHELF_ID or "Not set"}')
+        print(f'BookStack Book ID: {BOOKSTACK_BOOK_ID or "Not set"} (legacy mode)')
     
     if args.dryrun:
         print('\n*** DRY RUN MODE - No changes will be made ***\n')
@@ -2187,6 +2369,7 @@ Examples:
                 dryrun=args.dryrun,
                 skip_existing=not args.update_existing,
                 space_key=CONFLUENCE_SPACE_KEY,
+                shelf_id=int(BOOKSTACK_SHELF_ID) if BOOKSTACK_SHELF_ID else None,
                 book_id=int(BOOKSTACK_BOOK_ID) if BOOKSTACK_BOOK_ID else None,
                 user_map=user_map
             )

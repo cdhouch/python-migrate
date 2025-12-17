@@ -14,9 +14,10 @@ A Python-based migration tool for transferring data between platforms:
 
 ### Confluence to BookStack
 - **Page Migration**: Sync all pages from a Confluence space to BookStack
-- **Space Migration**: Convert Confluence spaces to BookStack books
-- **Hierarchy Preservation**: Maintains parent-child relationships between pages
+- **Space Migration**: Convert Confluence spaces to BookStack shelves
+- **Hierarchy Preservation**: Maintains full hierarchy: Space → Shelf → Books (from top-level pages) → Chapters → Pages
 - **HTML Content**: Preserves formatted content from Confluence
+- **User Assignment**: Assigns pages to correct users based on Confluence page creators
 
 ### Common Features
 - **Dry Run Mode**: Preview all changes before applying them
@@ -90,7 +91,8 @@ CONFLUENCE_SPACE_KEY=SPACE                # Your Confluence space key (optional)
 BOOKSTACK_HOST=https://your-bookstack-instance.com
 BOOKSTACK_TOKEN_ID=your-bookstack-token-id
 BOOKSTACK_TOKEN_SECRET=your-bookstack-token-secret
-BOOKSTACK_BOOK_ID=1                       # Your BookStack book ID (optional, for page migration)
+BOOKSTACK_SHELF_ID=1                      # Your BookStack shelf ID (recommended: for new hierarchy)
+BOOKSTACK_BOOK_ID=1                       # Your BookStack book ID (legacy: for single-book mode)
 ```
 
 ### Getting Your API Credentials
@@ -212,7 +214,9 @@ python migrate.py confluence --sync-pages
 python migrate.py confluence --sync-pages --update-existing
 ```
 
-**Note**: For page migration, you need to set `BOOKSTACK_BOOK_ID` in your `.env` file to specify which book to add pages to.
+**Note**: For page migration, you need to set either:
+- `BOOKSTACK_SHELF_ID` (recommended): Uses new hierarchy where Confluence spaces become shelves, top-level pages become books
+- `BOOKSTACK_BOOK_ID` (legacy): Uses single-book mode where all pages go into one book
 
 ## Command Reference
 
@@ -297,10 +301,22 @@ The tool maps Jira issue types to OpenProject work package types:
    - Run `python migrate.py confluence --sync-users --user-source atlassian` to import users
 3. **Migrate Spaces**: Run `python migrate.py confluence --sync-spaces --dryrun` to preview
 4. **Create Books**: Run `python migrate.py confluence --sync-spaces` to create books
-5. **Set Book ID**: Update `BOOKSTACK_BOOK_ID` in `.env` with the target book ID
+5. **Set Shelf ID** (recommended): Update `BOOKSTACK_SHELF_ID` in `.env` with the target shelf ID
+   - Or **Set Book ID** (legacy): Update `BOOKSTACK_BOOK_ID` in `.env` for single-book mode
 6. **Preview Pages**: Run `python migrate.py confluence --sync-pages --dryrun` to preview
 7. **Migrate Pages**: Run `python migrate.py confluence --sync-pages` to migrate pages
 8. **Verify**: Check BookStack to confirm the migration and user assignments
+
+**New Hierarchy (with BOOKSTACK_SHELF_ID):**
+- Confluence Space → BookStack Shelf
+- Top-level Confluence pages → BookStack Books (within the shelf)
+- Confluence pages with children → BookStack Chapters (within their book)
+- Other Confluence pages → BookStack Pages (within their chapter or book)
+
+**Legacy Mode (with BOOKSTACK_BOOK_ID):**
+- All Confluence pages → Single BookStack Book
+- Pages with children → BookStack Chapters
+- Other pages → BookStack Pages
 
 ## Troubleshooting
 
