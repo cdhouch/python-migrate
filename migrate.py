@@ -30,6 +30,31 @@ from enum import Enum
 load_dotenv()
 
 # =============================================================================
+# Adaptive Rate Limiting
+# =============================================================================
+
+# Adaptive rate limiting - starts fast, slows down if we hit rate limits
+_rate_limit_delay = 0.1  # Start with 0.1 second delay (10 requests/second)
+_max_rate_limit_delay = 1.0  # Maximum delay if we keep hitting rate limits
+
+def adaptive_sleep():
+    """Sleep with adaptive delay based on rate limiting."""
+    global _rate_limit_delay
+    time.sleep(_rate_limit_delay)
+
+def handle_rate_limit():
+    """Handle rate limit by increasing delay and waiting."""
+    global _rate_limit_delay
+    _rate_limit_delay = min(_rate_limit_delay * 1.5, _max_rate_limit_delay)
+    print(f'  Rate limited, increasing delay to {_rate_limit_delay:.2f}s...')
+    time.sleep(2)  # Wait before retry
+
+def reset_rate_limit():
+    """Reset rate limit delay back to minimum (call after successful batch)."""
+    global _rate_limit_delay
+    _rate_limit_delay = 0.1
+
+# =============================================================================
 # Migration Type Enum
 # =============================================================================
 
@@ -482,7 +507,7 @@ def fetch_confluence_spaces(space_key=None):
 
 
 def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,version,ancestors,space,history'):
-    """Fetch pages from Confluence. Can fetch all pages in a space or a specific page."""
+    """Fetch pages and folders from Confluence. Can fetch all content in a space or a specific item."""
     if page_id:
         url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content/{page_id}'
         params = {'expand': expand}
@@ -491,36 +516,49 @@ def fetch_confluence_pages(space_key=None, page_id=None, expand='body.storage,ve
         return [response.json()]
     
     url = f'https://{CONFLUENCE_BASE_URL}/wiki/rest/api/content'
-    pages = []
+    all_content = []
     start = 0
     limit = 50
     
-    params = {
-        'start': start,
-        'limit': limit,
-        'expand': expand,
-        'type': 'page'
-    }
+    # Fetch both pages and folders (folders may not be supported in all Confluence versions)
+    content_types = ['page', 'folder']
     
-    if space_key:
-        params['spaceKey'] = space_key
+    for content_type in content_types:
+        start = 0
+        params = {
+            'start': start,
+            'limit': limit,
+            'expand': expand,
+            'type': content_type
+        }
+        
+        if space_key:
+            params['spaceKey'] = space_key
+        
+        try:
+            while True:
+                params['start'] = start
+                response = requests.get(url, auth=confluence_auth, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                all_content.extend(data.get('results', []))
+                
+                if len(data.get('results', [])) < limit:
+                    break
+                start += limit
+                
+                print(f'Fetched {len(all_content)} items so far...')
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 501:
+                # Folders not supported in this Confluence instance, skip
+                print(f'Note: Folders are not supported in this Confluence instance (type={content_type})')
+                continue
+            else:
+                raise
     
-    while True:
-        params['start'] = start
-        response = requests.get(url, auth=confluence_auth, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        pages.extend(data.get('results', []))
-        
-        if len(data.get('results', [])) < limit:
-            break
-        start += limit
-        
-        print(f'Fetched {len(pages)} pages so far...')
-    
-    print(f'Found {len(pages)} pages in Confluence.')
-    return pages
+    print(f'Found {len(all_content)} items (pages and folders) in Confluence.')
+    return all_content
 
 
 def fetch_confluence_page_children(page_id, expand='body.storage,version'):
@@ -765,8 +803,8 @@ def fetch_bookstack_pages(book_id=None):
         
         page += 1
         
-        # Small delay to avoid rate limiting
-        time.sleep(0.1)
+        # Small delay to avoid rate limiting (adaptive)
+        adaptive_sleep()
         if book_id_int:
             print(f'Fetched {len(pages)} pages from book {book_id_int} so far...')
         else:
@@ -806,6 +844,10 @@ def create_bookstack_book(name, description='', shelf_id=None, dryrun=False):
         payload['shelf_id'] = shelf_id
     
     response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         return response.json()
     else:
@@ -854,8 +896,7 @@ def fetch_bookstack_chapters(book_id):
         
         # Handle rate limiting
         if response.status_code == 429:
-            print(f'Rate limited, waiting 2 seconds...')
-            time.sleep(2)
+            handle_rate_limit()
             continue
         
         response.raise_for_status()
@@ -885,8 +926,8 @@ def fetch_bookstack_chapters(book_id):
         
         page += 1
         
-        # Rate limiting - small delay between requests
-        time.sleep(0.2)
+        # Rate limiting - small delay between requests (adaptive)
+        adaptive_sleep()
     
     return chapters
 
@@ -905,6 +946,10 @@ def create_bookstack_chapter(name, description, book_id, dryrun=False):
     }
     
     response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         return response.json()
     else:
@@ -959,6 +1004,10 @@ def create_bookstack_page(name, html, book_id, chapter_id=None, parent_id=None, 
         payload['owned_by'] = owner_id
     
     response = requests.post(url, headers=bookstack_headers, json=payload)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.post(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         result = response.json()
         # Debug: check if chapter was set
@@ -1009,6 +1058,10 @@ def update_bookstack_page(page_id, name=None, html=None, parent_id=None, chapter
     payload['book_id'] = current_data.get('book_id')
     
     response = requests.put(url, headers=bookstack_headers, json=payload)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.put(url, headers=bookstack_headers, json=payload)
     if response.status_code in [200, 201]:
         # Verify the update actually worked
         if owner_id is not None:
@@ -1030,6 +1083,10 @@ def delete_bookstack_chapter(chapter_id, dryrun=False):
     
     url = f'{BOOKSTACK_BASE_URL}/api/chapters/{chapter_id}'
     response = requests.delete(url, headers=bookstack_headers)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.delete(url, headers=bookstack_headers)
     if response.status_code in [200, 204]:
         return True
     else:
@@ -1046,6 +1103,10 @@ def delete_bookstack_page(page_id, dryrun=False):
     
     url = f'{BOOKSTACK_BASE_URL}/api/pages/{page_id}'
     response = requests.delete(url, headers=bookstack_headers)
+    if response.status_code == 429:
+        handle_rate_limit()
+        # Retry once
+        response = requests.delete(url, headers=bookstack_headers)
     if response.status_code in [200, 204]:
         return True
     else:
@@ -1105,7 +1166,8 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
             for i, page in enumerate(pages_sorted, 1):
                 page_id = page['id']
                 page_name = page['name']
-                if i % 10 == 0 or i == len(pages_sorted):
+                # Show progress every 10 pages or for every page if less than 50 total
+                if len(pages_sorted) <= 50 or i % 10 == 0 or i == len(pages_sorted):
                     print(f'[{i}/{len(pages_sorted)}] Deleting page {page_id}: {page_name[:50]}...')
                 
                 if delete_bookstack_page(page_id, dryrun=False):
@@ -1113,11 +1175,8 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
                 else:
                     pages_errors += 1
                 
-                # Rate limiting
-                if i % 10 == 0:
-                    time.sleep(1)
-                else:
-                    time.sleep(0.3)
+                # Rate limiting (adaptive)
+                adaptive_sleep()
         
         # Fetch chapters
         print(f'\nFetching chapters from book {book_id}...')
@@ -1145,7 +1204,8 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
             for i, chapter in enumerate(chapters_sorted, 1):
                 chapter_id = chapter['id']
                 chapter_name = chapter['name']
-                if i % 10 == 0 or i == len(chapters_sorted):
+                # Show progress every 10 chapters or for every chapter if less than 50 total
+                if len(chapters_sorted) <= 50 or i % 10 == 0 or i == len(chapters_sorted):
                     print(f'[{i}/{len(chapters_sorted)}] Deleting chapter {chapter_id}: {chapter_name[:50]}...')
                 
                 if delete_bookstack_chapter(chapter_id, dryrun=False):
@@ -1153,11 +1213,8 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
                 else:
                     chapters_errors += 1
                 
-                # Rate limiting
-                if i % 10 == 0:
-                    time.sleep(1)
-                else:
-                    time.sleep(0.3)
+                # Rate limiting (adaptive)
+                adaptive_sleep()
         
         # If nothing was found or deleted, we're done
         if len(pages) == 0 and len(chapters) == 0:
@@ -1166,8 +1223,8 @@ def delete_all_bookstack_pages(book_id=None, dryrun=False):
         
         print(f'\nIteration {iteration} summary: Deleted {pages_deleted} pages, {chapters_deleted} chapters')
         
-        # Small delay between iterations
-        time.sleep(1)
+        # Small delay between iterations (adaptive)
+        adaptive_sleep()
     
     print('\n' + '=' * 60)
     print('DELETE CONTENT COMPLETE')
@@ -1609,7 +1666,7 @@ def sync_users_to_bookstack(source='atlassian', dryrun=False, skip_existing=True
                 print(f'  Created user: {display_name} ({email})')
                 created += 1
                 existing_by_email[email_lower] = result
-                time.sleep(0.3)  # Rate limit protection
+                adaptive_sleep()  # Adaptive rate limit protection
             else:
                 errors += 1
     
@@ -1648,15 +1705,55 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
         print('Error: CONFLUENCE_SPACE_KEY must be specified')
         return
     
+    # If shelf_id is not provided, automatically create a shelf from the Confluence space
+    if not shelf_id and not book_id:
+        print('No BOOKSTACK_SHELF_ID specified, creating shelf from Confluence space...')
+        # Fetch the Confluence space to get its name
+        confluence_spaces = fetch_confluence_spaces(space_key=space_key)
+        if not confluence_spaces:
+            print(f'Error: Space {space_key} not found in Confluence')
+            return
+        
+        space = confluence_spaces[0]
+        space_name = space['name']
+        space_description = space.get('description', {}).get('plain', {}).get('value', '')
+        
+        # Check if shelf already exists
+        bookstack_shelves = fetch_bookstack_shelves()
+        existing_shelf = bookstack_shelves.get(space_name)
+        
+        if existing_shelf:
+            shelf_id = existing_shelf['id']
+            print(f'  Found existing shelf "{space_name}" (ID: {shelf_id}), using it')
+        else:
+            if dryrun:
+                print(f'  [DRYRUN] Would create shelf "{space_name}"')
+                shelf_id = 'dryrun_shelf_id'
+            else:
+                result = create_bookstack_shelf(
+                    name=space_name,
+                    description=space_description,
+                    dryrun=dryrun
+                )
+                if result:
+                    shelf_id = result['id']
+                    print(f'  Created shelf "{space_name}" (ID: {shelf_id})')
+                else:
+                    print(f'  Error creating shelf "{space_name}"')
+                    return
+    
     # Determine which mode to use
-    use_shelf_mode = shelf_id is not None
+    use_shelf_mode = shelf_id is not None and shelf_id != 'dryrun_shelf_id'
     use_legacy_mode = book_id is not None
     
     if not use_shelf_mode and not use_legacy_mode:
-        print('Error: Either BOOKSTACK_SHELF_ID or BOOKSTACK_BOOK_ID must be specified')
-        print('  Use BOOKSTACK_SHELF_ID for new hierarchy (Space->Shelf->Books->Chapters->Pages)')
-        print('  Use BOOKSTACK_BOOK_ID for legacy mode (Space->Book->Chapters->Pages)')
-        return
+        if shelf_id == 'dryrun_shelf_id':
+            use_shelf_mode = True  # Allow dryrun to proceed
+        else:
+            print('Error: Either BOOKSTACK_SHELF_ID or BOOKSTACK_BOOK_ID must be specified')
+            print('  Use BOOKSTACK_SHELF_ID for new hierarchy (Space->Shelf->Books->Chapters->Pages)')
+            print('  Use BOOKSTACK_BOOK_ID for legacy mode (Space->Book->Chapters->Pages)')
+            return
     
     if use_shelf_mode:
         print(f'Using shelf-based hierarchy (shelf_id: {shelf_id})')
@@ -1689,102 +1786,490 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
     # Build a map of Confluence page IDs to pages for hierarchy
     confluence_pages_map = {page['id']: page for page in confluence_pages}
     
+    # Extract parent pages from ancestor data that might not be in the main pages list
+    # These are often "folders" in Confluence that should become books
+    print('\nExtracting parent pages from ancestor data (may include folders)...')
+    parent_pages_from_ancestors = {}
+    total_pages = len(confluence_pages)
+    for idx, page in enumerate(confluence_pages, 1):
+        if idx % 50 == 0 or idx == total_pages:
+            print(f'  Processing page {idx}/{total_pages}...')
+        ancestors = page.get('ancestors', [])
+        for ancestor in ancestors:
+            ancestor_id = ancestor.get('id')
+            # If this ancestor isn't in our pages list, add it as a potential folder
+            if ancestor_id and ancestor_id not in confluence_pages_map:
+                if ancestor_id not in parent_pages_from_ancestors:
+                    # Create a minimal page object from ancestor data
+                    parent_pages_from_ancestors[ancestor_id] = {
+                        'id': ancestor_id,
+                        'title': ancestor.get('title', 'Unknown'),
+                        'type': 'page',  # Assume it's a page, even if it acts as a folder
+                        'ancestors': ancestors[:ancestors.index(ancestor)],  # Ancestors before this one
+                        '_is_folder': True  # Mark as likely folder
+                    }
+    
+    # Add these parent pages to our pages list and map
+    if parent_pages_from_ancestors:
+        print(f'Found {len(parent_pages_from_ancestors)} parent pages/folders referenced but not in main list:')
+        for parent_id, parent_page in parent_pages_from_ancestors.items():
+            print(f'  - {parent_page["title"]} (ID: {parent_id})')
+            confluence_pages.append(parent_page)
+            confluence_pages_map[parent_id] = parent_page
+    
     # For shelf mode: Identify top-level pages (pages with no ancestors) - these become books
     top_level_pages = []
     page_to_book_map = {}  # Map Confluence page ID -> BookStack book ID
     
     if use_shelf_mode:
         print('\nIdentifying top-level pages (these will become books)...')
+        # First, identify which pages have children (these are "folders" or container pages)
+        print('  Checking which pages have children...')
+        pages_with_children = set()
+        total_pages = len(confluence_pages)
+        for idx, page in enumerate(confluence_pages, 1):
+            if idx % 50 == 0 or idx == total_pages:
+                print(f'    Checking page {idx}/{total_pages}...')
+            page_id = page['id']
+            # Check if any other page has this page as an ancestor
+            for other_page in confluence_pages:
+                other_ancestors = other_page.get('ancestors', [])
+                if other_ancestors and other_ancestors[-1]['id'] == page_id:
+                    pages_with_children.add(page_id)
+                    break
+        
+        # Pages with 0, 1, or 2 ancestors that have children become books
+        # This makes the structure more granular: each major topic/folder becomes its own book
+        # 0 ancestors = root pages (if they have children)
+        # 1 ancestor = direct children of root (if they have children)
+        # 2 ancestors = grandchildren of root (if they have children, like "Fox Resources", "Projects Folder")
         for page in confluence_pages:
+            page_id = page['id']
             ancestors = page.get('ancestors', [])
-            if not ancestors:
+            ancestor_count = len(ancestors)
+            # Only create books for pages that have children (are folders/containers) and are at depth 0-2
+            if ancestor_count <= 2 and page_id in pages_with_children:
                 top_level_pages.append(page)
-                print(f'  Top-level page: {page["title"]} (ID: {page["id"]})')
+                if ancestor_count == 0:
+                    print(f'  Root page (book): {page["title"]} (ID: {page["id"]})')
+                elif ancestor_count == 1:
+                    print(f'  Top-level child (book): {page["title"]} (ID: {page["id"]}, parent: {ancestors[0].get("title", "unknown")})')
+                else:
+                    print(f'  Second-level child (book): {page["title"]} (ID: {page["id"]}, grandparent: {ancestors[0].get("title", "unknown")}, parent: {ancestors[1].get("title", "unknown")})')
         
         print(f'\nFound {len(top_level_pages)} top-level pages. Creating books in shelf {shelf_id}...')
         
-        # Fetch existing books in the shelf
+        # Fetch ALL existing books (not just in shelf) to check for duplicates
         all_existing_books = fetch_bookstack_books()
-        existing_books_by_name = {book['name']: book for book in all_existing_books if book.get('shelf_id') == int(shelf_id)}
+        # Create a map of book names to books (list of books with same name)
+        existing_books_by_name = {}
+        for book in all_existing_books:
+            book_name = book['name']
+            if book_name not in existing_books_by_name:
+                existing_books_by_name[book_name] = []
+            existing_books_by_name[book_name].append(book)
+        
+        # Merge duplicate books (books with same name)
+        print('\nChecking for duplicate book names and merging...')
+        books_to_delete = []
+        for book_name, books_with_name in existing_books_by_name.items():
+            if len(books_with_name) > 1:
+                print(f'  Found {len(books_with_name)} books with name "{book_name}"')
+                # Count pages in each book
+                book_page_counts = []
+                for book in books_with_name:
+                    book_id = book['id']
+                    pages = fetch_bookstack_pages(book_id=book_id)
+                    page_count = len(pages)
+                    chapters = fetch_bookstack_chapters(book_id)
+                    chapter_count = len(chapters)
+                    total_content = page_count + chapter_count
+                    book_page_counts.append((book_id, total_content, page_count, chapter_count, book))
+                    print(f'    Book ID {book_id}: {page_count} pages, {chapter_count} chapters (total: {total_content})')
+                
+                # Sort by total content count (descending), then by ID (ascending) for tie-breaking
+                book_page_counts.sort(key=lambda x: (-x[1], x[0]))
+                
+                # Keep the book with most content (or first one if equal)
+                keep_book = book_page_counts[0]
+                keep_book_id = keep_book[0]
+                keep_total = keep_book[1]
+                print(f'    Keeping book ID {keep_book_id} ({keep_total} total items)')
+                
+                # Copy content from smaller books to the kept book, then delete smaller books
+                for book_id, total_content, page_count, chapter_count, book in book_page_counts[1:]:
+                    print(f'    Copying {page_count} pages and {chapter_count} chapters from book ID {book_id} into book ID {keep_book_id}...')
+                    if not dryrun:
+                        # Fetch all content from the book to merge
+                        pages_to_copy = fetch_bookstack_pages(book_id=book_id)
+                        chapters_to_copy = fetch_bookstack_chapters(book_id)
+                        
+                        # Create a map of old chapter IDs to new chapter IDs
+                        chapter_id_map = {}
+                        
+                        # Copy chapters first (so we can map pages to new chapters)
+                        for chapter in chapters_to_copy:
+                            old_chapter_id = chapter['id']
+                            chapter_name = chapter['name']
+                            chapter_description = chapter.get('description', '')
+                            # Create chapter in kept book
+                            new_chapter = create_bookstack_chapter(
+                                name=chapter_name,
+                                description=chapter_description,
+                                book_id=keep_book_id,
+                                dryrun=dryrun
+                            )
+                            if new_chapter:
+                                new_chapter_id = new_chapter['id']
+                                chapter_id_map[old_chapter_id] = new_chapter_id
+                                adaptive_sleep()
+                        
+                        # Copy pages to the kept book
+                        copied_pages = 0
+                        for page in pages_to_copy:
+                            page_name = page['name']
+                            page_html = page.get('html', '')
+                            old_chapter_id = page.get('chapter_id')
+                            new_chapter_id = chapter_id_map.get(old_chapter_id) if old_chapter_id else None
+                            
+                            # Create page in kept book
+                            new_page = create_bookstack_page(
+                                name=page_name,
+                                html=page_html,
+                                book_id=keep_book_id,
+                                chapter_id=new_chapter_id,
+                                dryrun=dryrun
+                            )
+                            if new_page:
+                                copied_pages += 1
+                                # Update chapter_id and owner if needed (BookStack API quirk)
+                                if new_chapter_id:
+                                    update_bookstack_page(new_page['id'], chapter_id=new_chapter_id, dryrun=dryrun)
+                                adaptive_sleep()
+                        
+                        print(f'      Copied {len(chapter_id_map)} chapters and {copied_pages} pages')
+                    
+                    # Mark book for deletion
+                    books_to_delete.append(book_id)
+                
+                # Update the map to only reference the kept book
+                existing_books_by_name[book_name] = [keep_book[4]]
+        
+        # Delete merged books (after copying their content)
+        if books_to_delete and not dryrun:
+            print(f'\nDeleting {len(books_to_delete)} merged books (content has been copied to kept books)...')
+            for book_id in books_to_delete:
+                print(f'  Deleting book ID {book_id}...')
+                url = f'{BOOKSTACK_BASE_URL}/api/books/{book_id}'
+                response = requests.delete(url, headers=bookstack_headers)
+                if response.status_code == 429:
+                    handle_rate_limit()
+                    response = requests.delete(url, headers=bookstack_headers)
+                if response.status_code in [200, 204]:
+                    print(f'    Successfully deleted book {book_id}')
+                else:
+                    print(f'    Warning: Could not delete book {book_id}: {response.status_code}')
+                adaptive_sleep()
+        
+        # Convert back to single book per name (for compatibility with existing code)
+        existing_books_by_name_single = {}
+        for book_name, books_list in existing_books_by_name.items():
+            existing_books_by_name_single[book_name] = books_list[0]
+        existing_books_by_name = existing_books_by_name_single
+        
+        # Get current shelf data to track books in shelf
+        # Handle dryrun shelf_id
+        actual_shelf_id = shelf_id if shelf_id != 'dryrun_shelf_id' else None
+        shelf_url = f'{BOOKSTACK_BASE_URL}/api/shelves/{actual_shelf_id}' if actual_shelf_id else None
+        shelf_data = None
+        existing_book_ids_in_shelf = []
+        if not dryrun and actual_shelf_id:
+            shelf_response = requests.get(shelf_url, headers=bookstack_headers)
+            if shelf_response.status_code == 200:
+                shelf_data = shelf_response.json()
+                existing_book_ids_in_shelf = [b.get('id') for b in shelf_data.get('books', [])]
+                print(f'  Found {len(existing_book_ids_in_shelf)} existing books in shelf')
+            else:
+                print(f'  Warning: Could not fetch shelf data: {shelf_response.status_code}')
+                # Try to fetch shelf data again later if needed
+        
+        # After merging duplicates, ensure all kept books are in the shelf
+        if not dryrun and actual_shelf_id:
+            print('\nEnsuring all kept books (after merging) are in shelf...')
+            for book_name, book in existing_books_by_name.items():
+                kept_book_id = book['id']
+                if kept_book_id not in existing_book_ids_in_shelf:
+                    print(f'  Adding kept book "{book_name}" (ID: {kept_book_id}) to shelf')
+                    existing_book_ids_in_shelf.append(kept_book_id)
         
         # Create a book for each top-level page
         for top_page in top_level_pages:
             page_id = top_page['id']
             page_title = top_page['title']
             
-            # Check if book already exists
+            # Check if book already exists (by name, regardless of shelf)
             existing_book = existing_books_by_name.get(page_title)
-            if existing_book and skip_existing:
-                print(f'  Book "{page_title}" already exists (ID: {existing_book["id"]})')
-                page_to_book_map[page_id] = existing_book['id']
+            if existing_book:
+                book_id = existing_book['id']
+                print(f'Book "{page_title}" already exists (ID: {book_id}), reusing it')
+                page_to_book_map[page_id] = book_id
+                # Add to shelf if not already there
+                if book_id not in existing_book_ids_in_shelf:
+                    existing_book_ids_in_shelf.append(book_id)
                 continue
             
-            if dryrun:
-                print(f'  [DRYRUN] Would create book "{page_title}" in shelf {shelf_id}')
+            if dryrun or not actual_shelf_id:
+                print(f'[DRYRUN] Would create book "{page_title}" in shelf {shelf_id}')
                 page_to_book_map[page_id] = 'dryrun_book_id'
             else:
+                # Note: shelf_id is not passed here because BookStack API doesn't add books
+                # to shelves during creation. We update the shelf after all books are created.
                 result = create_bookstack_book(
                     name=page_title,
                     description='',  # Could extract from page content if needed
-                    shelf_id=int(shelf_id),
+                    shelf_id=None,  # Shelf association handled separately
                     dryrun=dryrun
                 )
                 if result:
                     book_id = result['id']
-                    print(f'  Created book "{page_title}" (ID: {book_id}) in shelf {shelf_id}')
-                    # BookStack requires updating the shelf to include the book, not setting shelf_id on the book
-                    # Get current shelf data
-                    shelf_url = f'{BOOKSTACK_BASE_URL}/api/shelves/{shelf_id}'
-                    shelf_response = requests.get(shelf_url, headers=bookstack_headers)
-                    if shelf_response.status_code == 200:
-                        shelf_data = shelf_response.json()
-                        # Get existing books in the shelf
-                        existing_book_ids = [b.get('id') for b in shelf_data.get('books', [])]
-                        if book_id not in existing_book_ids:
-                            existing_book_ids.append(book_id)
-                            # Update shelf with the new book
-                            update_payload = {
-                                'name': shelf_data.get('name', ''),
-                                'description': shelf_data.get('description', ''),
-                                'books': existing_book_ids
-                            }
-                            update_response = requests.put(shelf_url, headers=bookstack_headers, json=update_payload)
-                            if update_response.status_code in [200, 201]:
-                                print(f'  Added book to shelf {shelf_id}')
-                            else:
-                                print(f'  Warning: Could not add book to shelf: {update_response.status_code} - {update_response.text}')
-                    else:
-                        print(f'  Warning: Could not fetch shelf data: {shelf_response.status_code}')
+                    print(f'Created book "{page_title}" (ID: {book_id})')
                     page_to_book_map[page_id] = book_id
-                    time.sleep(0.5)  # Rate limit protection
+                    # Update our cache to track newly created books
+                    existing_books_by_name[page_title] = result
+                    # Add to shelf list (will update shelf after all books are processed)
+                    if book_id not in existing_book_ids_in_shelf:
+                        existing_book_ids_in_shelf.append(book_id)
+                    if not dryrun:
+                        adaptive_sleep()  # Adaptive rate limit protection
                 else:
                     print(f'  Error creating book for "{page_title}"')
         
-        # Map all pages to their book (based on top-level ancestor)
+        # After creating all books, check for and merge any duplicates that were just created
+        if not dryrun:
+            print('\nChecking for duplicate books created in this run...')
+            # Re-fetch all books to get the current state
+            all_books_after_creation = fetch_bookstack_books()
+            books_by_name_after = {}
+            for book in all_books_after_creation:
+                book_name = book['name']
+                if book_name not in books_by_name_after:
+                    books_by_name_after[book_name] = []
+                books_by_name_after[book_name].append(book)
+            
+            # Find duplicates
+            duplicates_found = False
+            books_to_delete_after_creation = []
+            for book_name, books_with_name in books_by_name_after.items():
+                if len(books_with_name) > 1:
+                    duplicates_found = True
+                    print(f'  Found {len(books_with_name)} books with name "{book_name}"')
+                    # Count content in each book
+                    book_content_counts = []
+                    for book in books_with_name:
+                        book_id = book['id']
+                        pages = fetch_bookstack_pages(book_id=book_id)
+                        chapters = fetch_bookstack_chapters(book_id)
+                        total_content = len(pages) + len(chapters)
+                        book_content_counts.append((book_id, total_content, len(pages), len(chapters), book))
+                        print(f'    Book ID {book_id}: {len(pages)} pages, {len(chapters)} chapters (total: {total_content})')
+                    
+                    # Sort by total content (descending), then by ID (ascending) for tie-breaking
+                    book_content_counts.sort(key=lambda x: (-x[1], x[0]))
+                    
+                    # Keep the book with most content
+                    keep_book = book_content_counts[0]
+                    keep_book_id = keep_book[0]
+                    keep_total = keep_book[1]
+                    print(f'    Keeping book ID {keep_book_id} ({keep_total} total items)')
+                    
+                    # Copy content from smaller books to the kept book, then delete smaller books
+                    for book_id, total_content, page_count, chapter_count, book in book_content_counts[1:]:
+                        print(f'    Copying {page_count} pages and {chapter_count} chapters from book ID {book_id} into book ID {keep_book_id}...')
+                        # Fetch all content from the book to merge
+                        pages_to_copy = fetch_bookstack_pages(book_id=book_id)
+                        chapters_to_copy = fetch_bookstack_chapters(book_id)
+                        
+                        # Create a map of old chapter IDs to new chapter IDs
+                        chapter_id_map = {}
+                        
+                        # Copy chapters first (so we can map pages to new chapters)
+                        for chapter in chapters_to_copy:
+                            old_chapter_id = chapter['id']
+                            chapter_name = chapter['name']
+                            chapter_description = chapter.get('description', '')
+                            # Create chapter in kept book
+                            new_chapter = create_bookstack_chapter(
+                                name=chapter_name,
+                                description=chapter_description,
+                                book_id=keep_book_id,
+                                dryrun=dryrun
+                            )
+                            if new_chapter:
+                                new_chapter_id = new_chapter['id']
+                                chapter_id_map[old_chapter_id] = new_chapter_id
+                                adaptive_sleep()
+                        
+                        # Copy pages to the kept book
+                        copied_pages = 0
+                        for page in pages_to_copy:
+                            page_name = page['name']
+                            page_html = page.get('html', '')
+                            old_chapter_id = page.get('chapter_id')
+                            new_chapter_id = chapter_id_map.get(old_chapter_id) if old_chapter_id else None
+                            
+                            # Create page in kept book
+                            new_page = create_bookstack_page(
+                                name=page_name,
+                                html=page_html,
+                                book_id=keep_book_id,
+                                chapter_id=new_chapter_id,
+                                dryrun=dryrun
+                            )
+                            if new_page:
+                                copied_pages += 1
+                                # Update chapter_id if needed (BookStack API quirk)
+                                if new_chapter_id:
+                                    update_bookstack_page(new_page['id'], chapter_id=new_chapter_id, dryrun=dryrun)
+                                adaptive_sleep()
+                        
+                        print(f'      Copied {len(chapter_id_map)} chapters and {copied_pages} pages')
+                        
+                        # Mark book for deletion
+                        books_to_delete_after_creation.append(book_id)
+                        
+                        # Update page_to_book_map to point to the kept book
+                        for conf_page_id, mapped_book_id in list(page_to_book_map.items()):
+                            if mapped_book_id == book_id:
+                                page_to_book_map[conf_page_id] = keep_book_id
+                        
+                        # Update existing_book_ids_in_shelf to use kept book instead
+                        if book_id in existing_book_ids_in_shelf:
+                            existing_book_ids_in_shelf.remove(book_id)
+                            if keep_book_id not in existing_book_ids_in_shelf:
+                                existing_book_ids_in_shelf.append(keep_book_id)
+            
+            # Delete merged books
+            if books_to_delete_after_creation:
+                print(f'\nDeleting {len(books_to_delete_after_creation)} merged duplicate books...')
+                for book_id in books_to_delete_after_creation:
+                    print(f'  Deleting book ID {book_id}...')
+                    url = f'{BOOKSTACK_BASE_URL}/api/books/{book_id}'
+                    response = requests.delete(url, headers=bookstack_headers)
+                    if response.status_code == 429:
+                        handle_rate_limit()
+                        response = requests.delete(url, headers=bookstack_headers)
+                    if response.status_code in [200, 204]:
+                        print(f'    Successfully deleted book {book_id}')
+                    else:
+                        print(f'    Warning: Could not delete book {book_id}: {response.status_code}')
+                    adaptive_sleep()
+            
+            if not duplicates_found:
+                print('  No duplicates found in this run.')
+        
+        # After processing all books, update the shelf with all books at once
+        if not dryrun and actual_shelf_id:
+            # Fetch shelf data if we don't have it yet
+            if not shelf_data and shelf_url:
+                shelf_response = requests.get(shelf_url, headers=bookstack_headers)
+                if shelf_response.status_code == 200:
+                    shelf_data = shelf_response.json()
+                else:
+                    print(f'\nWarning: Could not fetch shelf data to update: {shelf_response.status_code}')
+            
+            if shelf_data and shelf_url:
+                print(f'\nAdding all {len(existing_book_ids_in_shelf)} books to shelf {actual_shelf_id}...')
+                update_payload = {
+                    'name': shelf_data.get('name', ''),
+                    'description': shelf_data.get('description', ''),
+                    'books': existing_book_ids_in_shelf
+                }
+                update_response = requests.put(shelf_url, headers=bookstack_headers, json=update_payload)
+                if update_response.status_code in [200, 201]:
+                    # Note: BookStack API doesn't support setting shelf_id on books directly.
+                    # The shelf relationship is managed entirely through the shelf's books array.
+                    # Verify the update actually worked
+                    time.sleep(0.5)  # Brief delay to ensure update is processed
+                    verify_response = requests.get(shelf_url, headers=bookstack_headers)
+                    if verify_response.status_code == 200:
+                        verify_data = verify_response.json()
+                        actual_books_in_shelf = verify_data.get('books', [])
+                        actual_book_ids = [b.get('id') for b in actual_books_in_shelf]
+                        if len(actual_book_ids) == len(existing_book_ids_in_shelf) and set(actual_book_ids) == set(existing_book_ids_in_shelf):
+                            print(f'  Successfully added {len(existing_book_ids_in_shelf)} books to shelf {actual_shelf_id} (verified)')
+                        else:
+                            print(f'  Warning: Shelf update reported success but verification failed')
+                            print(f'    Expected {len(existing_book_ids_in_shelf)} books, found {len(actual_book_ids)} books')
+                            print(f'    Retrying update...')
+                            # Retry once
+                            retry_response = requests.put(shelf_url, headers=bookstack_headers, json=update_payload)
+                            if retry_response.status_code in [200, 201]:
+                                time.sleep(0.5)  # Brief delay after retry
+                                retry_verify = requests.get(shelf_url, headers=bookstack_headers)
+                                if retry_verify.status_code == 200:
+                                    retry_data = retry_verify.json()
+                                    retry_book_ids = [b.get('id') for b in retry_data.get('books', [])]
+                                    if len(retry_book_ids) == len(existing_book_ids_in_shelf) and set(retry_book_ids) == set(existing_book_ids_in_shelf):
+                                        print(f'  Retry successful - {len(retry_book_ids)} books now in shelf')
+                                    else:
+                                        print(f'  Retry verification failed: expected {len(existing_book_ids_in_shelf)}, found {len(retry_book_ids)}')
+                                else:
+                                    print(f'  Retry successful but could not verify')
+                            else:
+                                print(f'  Retry failed: {retry_response.status_code} - {retry_response.text}')
+                    else:
+                        print(f'  Warning: Could not verify shelf update: {verify_response.status_code}')
+                        print(f'  Shelf update reported success, but verification failed')
+                else:
+                    print(f'  Warning: Could not update shelf: {update_response.status_code} - {update_response.text}')
+            elif not shelf_data:
+                print(f'\nWarning: Cannot update shelf - shelf data not available')
+        elif dryrun:
+            print(f'\n[DRYRUN] Would add {len(existing_book_ids_in_shelf)} books to shelf {shelf_id}')
+        
+        # Map all pages to their book (based on nearest book ancestor)
         print('\nMapping pages to their books...')
-        for page in confluence_pages:
+        # Create a set of page IDs that are books (0, 1, or 2 ancestors)
+        book_page_ids = {page['id'] for page in top_level_pages}
+        
+        total_pages = len(confluence_pages)
+        for idx, page in enumerate(confluence_pages, 1):
+            if idx % 50 == 0 or idx == total_pages:
+                print(f'  Mapping page {idx}/{total_pages}...')
             page_id = page['id']
             ancestors = page.get('ancestors', [])
             
-            # Find the top-level ancestor (first in ancestors list, or self if no ancestors)
-            if not ancestors:
-                # This is a top-level page, use its own book
-                page_to_book_map[page_id] = page_to_book_map.get(page_id)
-            else:
-                # Find the root ancestor (first in ancestors list)
+            # If this page is itself a book, it's already mapped
+            if page_id in book_page_ids:
+                continue
+            
+            # Walk up the ancestor chain to find the nearest book
+            # Start from the immediate parent and work up
+            found_book = False
+            for ancestor in reversed(ancestors):  # Start from immediate parent
+                ancestor_id = ancestor['id']
+                if ancestor_id in book_page_ids:
+                    # This ancestor is a book, use it
+                    if ancestor_id in page_to_book_map:
+                        page_to_book_map[page_id] = page_to_book_map[ancestor_id]
+                        found_book = True
+                        break
+            
+            # If no book ancestor found, try the root ancestor
+            if not found_book and ancestors:
                 root_ancestor_id = ancestors[0]['id']
-                # Walk up to find the top-level page
+                # Walk up to find any book
                 current_id = root_ancestor_id
                 while current_id in confluence_pages_map:
+                    if current_id in book_page_ids and current_id in page_to_book_map:
+                        page_to_book_map[page_id] = page_to_book_map[current_id]
+                        found_book = True
+                        break
                     current_page = confluence_pages_map[current_id]
                     current_ancestors = current_page.get('ancestors', [])
                     if not current_ancestors:
-                        # Found the top-level page
-                        if current_id in page_to_book_map:
-                            page_to_book_map[page_id] = page_to_book_map[current_id]
                         break
-                    else:
-                        current_id = current_ancestors[0]['id']
+                    current_id = current_ancestors[0]['id']
         
         print(f'Mapped {len([p for p in page_to_book_map.values() if p])} pages to books')
     
@@ -1793,12 +2278,14 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
     if use_shelf_mode:
         # Fetch pages from all books in the shelf
         all_existing_books = fetch_bookstack_books()
-        all_books = [b['id'] for b in all_existing_books if b.get('shelf_id') == int(shelf_id)]
+        all_books = [b['id'] for b in all_existing_books if actual_shelf_id and b.get('shelf_id') == int(actual_shelf_id)]
         all_books.extend([b for b in page_to_book_map.values() if isinstance(b, int)])
         all_books = list(set(all_books))  # Deduplicate
         
         bookstack_pages = []
-        for book_id in all_books:
+        print(f'Fetching pages from {len(all_books)} books...')
+        for idx, book_id in enumerate(all_books, 1):
+            print(f'  Fetching pages from book {idx}/{len(all_books)} (ID: {book_id})...')
             pages = fetch_bookstack_pages(book_id=str(book_id))
             bookstack_pages.extend(pages)
     else:
@@ -1833,8 +2320,12 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
     confluence_pages_map = {page['id']: page for page in confluence_pages}
     
     # Identify pages that have children (these will become chapters)
+    print('Identifying pages with children...')
     pages_with_children = set()
-    for page in confluence_pages:
+    total_pages = len(confluence_pages)
+    for idx, page in enumerate(confluence_pages, 1):
+        if idx % 50 == 0 or idx == total_pages:
+            print(f'  Checking page {idx}/{total_pages}...')
         page_id = page['id']
         # Check if any other page has this page as an ancestor
         for other_page in confluence_pages:
@@ -1856,12 +2347,14 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
         return len(ancestors)
     
     sorted_pages = sorted(confluence_pages, key=get_depth)
+    total_pages = len(sorted_pages)
+    print(f'\nProcessing {total_pages} pages...\n')
     
-    for page in sorted_pages:
+    for idx, page in enumerate(sorted_pages, 1):
         page_id = page['id']
         page_title = page['title']
         
-        print(f'\nProcessing {page_id}: {page_title[:50]}...')
+        print(f'[{idx}/{total_pages}] Processing {page_id}: {page_title[:50]}...')
         
         # Check if already exists (by name for now)
         existing_page = existing_by_confluence_id.get(page_title)
@@ -2025,7 +2518,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
                     existing_chapter_names[chapter_name.lower()] = chapter_result
                     print(f'  Created chapter {chapter_id} for "{chapter_name}"')
                     if not dryrun:
-                        time.sleep(0.5)  # Rate limit protection
+                        adaptive_sleep()  # Adaptive rate limit protection
                     
                     # Create an "Introduction" page in this chapter with the parent page's content
                     intro_result = create_bookstack_page(
@@ -2065,7 +2558,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
                                     print(f'  Updated intro page owner to user {update_owner_id}')
                     created += 1
                     if not dryrun:
-                        time.sleep(0.5)  # Rate limit protection
+                        adaptive_sleep()  # Adaptive rate limit protection
                 else:
                     errors += 1
         else:
@@ -2112,7 +2605,7 @@ def sync_confluence_pages(dryrun=False, skip_existing=True, space_key=None, shel
                     page_to_page_map[page_id] = bookstack_page_id
                     existing_by_confluence_id[page_title] = result
                     if not dryrun:
-                        time.sleep(0.5)  # Rate limit protection
+                        adaptive_sleep()  # Adaptive rate limit protection
                 else:
                     errors += 1
     
